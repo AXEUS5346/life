@@ -1,0 +1,455 @@
+:root {
+  /* the world is the only saturated thing on screen; the chrome stays cold */
+  --bg: #0a0d12;
+  --panel: #11161f;
+  --panel-2: #161d28;
+  --line: #222c3a;
+  --line-soft: #1a2230;
+  --ink: #dbe4f0;
+  --ink-dim: #7f8da6;
+  --ink-mid: #9aa8bd;
+  --ink-faint: #5d6b80;
+
+  --calm: #20c997;
+  --hunger: #f5a524;
+  --anger: #dc2626;
+  --fear: #dee2e6;
+  --love: #da77f2;
+  --ego: #7950f2;
+  --desire: #ff922b;
+  --lonely: #868e96;
+  --thirst: #38bdf8;
+  --dopamine: #f472b6;
+  --pred: #b4506e;
+
+  --male: #3b9dff;
+  --female: #ff6fa5;
+  --plant: #3a8c60;
+  --carcass: #603e30;
+
+  --mono: ui-monospace, "SF Mono", "JetBrains Mono", "Cascadia Code", Menlo, monospace;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  padding: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font-family: var(--mono);
+  font-size: 13px;
+  -webkit-font-smoothing: antialiased;
+}
+
+body { overflow: hidden; }
+
+button {
+  font-family: inherit;
+  font-size: inherit;
+  color: var(--ink);
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  padding: 5px 10px;
+  cursor: pointer;
+  transition: background 120ms ease, border-color 120ms ease;
+}
+button:hover { background: #1d2634; border-color: #2e3b4d; }
+button:active { background: #10161f; }
+button[data-active="true"] {
+  background: #1b2a3d;
+  border-color: var(--male);
+  color: #cfe4ff;
+}
+button:disabled { opacity: 0.4; cursor: default; }
+
+/* ---------------------------------------------------------------- layout */
+
+.app {
+  display: grid;
+  grid-template-columns: 1fr 372px;
+  grid-template-rows: 46px 1fr;
+  height: 100vh;
+  width: 100vw;
+}
+
+.topbar {
+  grid-column: 1 / -1;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 0 14px;
+  background: var(--panel);
+  border-bottom: 1px solid var(--line);
+}
+
+.brand {
+  font-weight: 700;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  color: var(--ink);
+  font-size: 12px;
+}
+.brand span { color: var(--ink-faint); font-weight: 400; letter-spacing: 0.1em; }
+
+.spacer { flex: 1; }
+
+.stage {
+  position: relative;
+  overflow: hidden;
+  background: #06080c;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.stage canvas {
+  display: block;
+  image-rendering: pixelated;
+  image-rendering: crisp-edges;
+  cursor: crosshair;
+}
+
+.overlay-hint {
+  position: absolute;
+  bottom: 10px;
+  left: 12px;
+  color: var(--ink-faint);
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  pointer-events: none;
+  text-shadow: 0 1px 3px #000;
+}
+
+.overlay-legend {
+  position: absolute;
+  top: 10px;
+  left: 12px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 10px;
+  pointer-events: none;
+  /* the map is busy now, so the emotion key needs a plate of its own or it
+     fights the terrain it is supposed to sit on top of */
+  background: rgba(8, 11, 16, 0.72);
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  border-radius: 4px;
+  padding: 6px 8px;
+  max-width: 46%;
+}
+.overlay-legend i {
+  display: inline-block;
+  width: 7px; height: 7px;
+  margin-right: 4px;
+  border-radius: 1px;
+  vertical-align: baseline;
+}
+.overlay-legend em {
+  font-style: normal;
+  color: var(--ink-mid);
+  font-size: 10px;
+  letter-spacing: 0.06em;
+}
+
+/* ---------------------------------------------------------------- sidebar */
+
+.side {
+  background: var(--panel);
+  border-left: 1px solid var(--line);
+  overflow-y: auto;
+  overflow-x: hidden;
+}
+.side::-webkit-scrollbar { width: 8px; }
+.side::-webkit-scrollbar-thumb { background: #1e2734; border-radius: 4px; }
+
+.sec { border-bottom: 1px solid var(--line-soft); padding: 11px 13px 13px; }
+.sec > h2 {
+  margin: 0 0 9px;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--ink-faint);
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+}
+.sec > h2 em { font-style: normal; color: var(--ink-mid); letter-spacing: 0.04em; text-transform: none; }
+
+.grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 7px 12px; }
+.summary {
+  margin: 0 0 11px;
+  font-size: 11.5px;
+  line-height: 1.65;
+  color: var(--ink-mid);
+  border-left: 2px solid var(--line);
+  padding-left: 9px;
+}
+.stat b .of { color: var(--ink-faint); font-size: 11px; font-weight: 400; }
+.stat { display: flex; flex-direction: column; gap: 1px; }
+.stat b {
+  font-size: 16px;
+  font-weight: 600;
+  line-height: 1.15;
+  color: var(--ink);
+  font-variant-numeric: tabular-nums;
+}
+.stat span { font-size: 10px; color: var(--ink-faint); letter-spacing: 0.07em; text-transform: uppercase; }
+.stat.warn b { color: var(--hunger); }
+.stat.bad b { color: var(--anger); }
+
+.preds { margin-top: 11px; padding-top: 9px; border-top: 1px dashed var(--line-soft); }
+.preds h3 {
+  margin: 0 0 7px;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+  color: var(--pred);
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 8px;
+}
+.preds h3 span {
+  font-weight: 400;
+  letter-spacing: 0.03em;
+  text-transform: none;
+  color: var(--ink-faint);
+  font-size: 10px;
+}
+.preds .stat b em { font-style: normal; color: var(--ink-faint); font-weight: 400; }
+
+.deaths { display: flex; flex-direction: column; gap: 4px; margin-top: 9px; }
+.death-row { display: grid; grid-template-columns: 74px 1fr 46px; align-items: center; gap: 7px; }
+.death-row span { font-size: 10.5px; color: var(--ink-mid); }
+.death-row b { font-size: 10.5px; text-align: right; color: var(--ink-dim); font-variant-numeric: tabular-nums; font-weight: 400; }
+.bar { height: 4px; background: #182130; border-radius: 2px; overflow: hidden; }
+.bar i { display: block; height: 100%; border-radius: 2px; }
+
+.chart { width: 100%; height: 62px; display: block; }
+
+/* ------------------------------------------------------- map key / roster */
+
+/* A titled block inside the world section. The sidebar used to be one wall
+   of stat tiles with no hierarchy; the key, the roster and the chart are
+   now separate blocks so each can be found by its heading. */
+.blk { margin-top: 11px; padding-top: 9px; border-top: 1px dashed var(--line-soft); }
+.blk:first-of-type { margin-top: 0; padding-top: 0; border-top: 0; }
+.blk > h3 {
+  margin: 0 0 7px;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+  color: var(--ink-faint);
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 8px;
+}
+.blk > h3 span {
+  font-weight: 400;
+  letter-spacing: 0.03em;
+  text-transform: none;
+  font-size: 9.5px;
+  opacity: 0.72;
+}
+
+/* The key is the alphabet of the map: swatch, name, and the one thing that
+   ground does to a creature. Two columns so nine grounds stay above the fold. */
+.key-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 3px 12px; }
+.key-row {
+  display: grid;
+  grid-template-columns: 12px 60px 1fr;
+  align-items: baseline;
+  gap: 6px;
+  min-width: 0;
+}
+.key-swatch {
+  width: 12px; height: 12px;
+  border-radius: 2px;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  align-self: center;
+}
+.key-name {
+  font-size: 10.5px;
+  color: var(--ink);
+  letter-spacing: 0.02em;
+}
+.key-note { font-size: 9.5px; color: var(--ink-faint); line-height: 1.45; }
+
+.pred-rule {
+  margin: 8px 0 0;
+  font-size: 9.5px;
+  line-height: 1.55;
+  color: var(--ink-faint);
+  border-left: 2px solid var(--pred);
+  padding-left: 7px;
+}
+.pred-empty {
+  margin: 8px 0 0;
+  font-size: 10.5px;
+  line-height: 1.6;
+  color: var(--ink-faint);
+}
+
+/* One block per animal. The sex colour rides on a small dot beside the name
+   rather than a thick rule down the side of the card: the label already says
+   male or female, and a coloured edge on every row is decoration pretending to
+   be data. The dot still lets a pair be matched up across the list without
+   reading. */
+.pred-list { display: flex; flex-direction: column; gap: 5px; margin-top: 8px; }
+.pred-row {
+  border: 1px solid var(--line-soft);
+  border-radius: 2px;
+  padding: 5px 7px;
+  background: linear-gradient(90deg, rgba(255, 255, 255, 0.03), transparent 62%);
+}
+.pred-sex {
+  width: 6px; height: 6px;
+  border-radius: 50%;
+  flex: none;
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.45);
+}
+.pred-row.m .pred-sex { background: var(--male); }
+.pred-row.f .pred-sex { background: var(--female); }
+.pred-id { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.pred-name { font-size: 10.5px; color: var(--ink); letter-spacing: 0.03em; display: flex; align-items: center; gap: 6px; }
+.pred-badge {
+  font-size: 8.5px;
+  letter-spacing: 0.12em;
+  padding: 1px 5px;
+  border-radius: 2px;
+  border: 1px solid currentColor;
+  white-space: nowrap;
+}
+.badge-hunt { color: var(--pred); background: rgba(180, 80, 110, 0.14); }
+.badge-den { color: var(--ink-faint); }
+
+.pred-read {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 2px 10px;
+  margin-top: 3px;
+  font-size: 9.5px;
+  color: var(--ink-faint);
+  letter-spacing: 0.03em;
+}
+.pred-read b {
+  color: var(--ink-mid);
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+.pred-read b.hurt { color: var(--anger); }
+
+/* The map is busy now, so the emotion key floating over it needs a plate of
+   its own or it fights the terrain it is supposed to sit on top of. */
+.overlay-hint {
+  background: rgba(8, 11, 16, 0.72);
+  border-radius: 3px;
+  padding: 3px 7px;
+}
+
+/* What the speed control is actually achieving, next to the buttons that
+   ask for it. A target you cannot see a miss against is just a label. */
+.speed-read {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 4px;
+  margin-left: 5px;
+  padding-left: 9px;
+  border-left: 1px solid var(--line);
+  font-size: 10px;
+  color: var(--ink-faint);
+  letter-spacing: 0.04em;
+  font-variant-numeric: tabular-nums;
+}
+.speed-read b { color: var(--ink-mid); font-weight: 600; font-size: 11px; }
+.speed-read em { font-style: normal; }
+
+/* ---------------------------------------------------------------- inspector */
+
+.empty { color: var(--ink-faint); font-size: 11.5px; line-height: 1.6; }
+
+.who { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; }
+.chip {
+  font-size: 10px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  padding: 2px 6px;
+  border-radius: 2px;
+  border: 1px solid currentColor;
+}
+.chip.m { color: var(--male); }
+.chip.f { color: var(--female); }
+.who .name { color: var(--ink); font-size: 12.5px; }
+.who .sub { color: var(--ink-faint); font-size: 10.5px; margin-left: auto; text-align: right; }
+
+.meter { margin-bottom: 6px; }
+.meter .lab { display: flex; justify-content: space-between; font-size: 10.5px; margin-bottom: 2px; }
+.meter .lab span:first-child { color: var(--ink-mid); }
+.meter .lab span:last-child { color: var(--ink-faint); font-variant-numeric: tabular-nums; }
+.meter .track { height: 3px; background: #182130; border-radius: 2px; overflow: hidden; }
+.meter .fill { height: 100%; border-radius: 2px; }
+
+.brain-hint { color: var(--ink-faint); font-size: 10px; margin: 7px 0 4px; letter-spacing: 0.04em; }
+.brain-canvas {
+  width: 100%;
+  display: block;
+  border: 1px solid var(--line-soft);
+  border-radius: 2px;
+  image-rendering: pixelated;
+  background: #080b10;
+}
+
+.verbs { display: flex; flex-direction: column; gap: 3px; margin-top: 10px; }
+.verb { display: grid; grid-template-columns: 62px 1fr 34px; align-items: center; gap: 7px; font-size: 10.5px; }
+.verb span { color: var(--ink-mid); }
+.verb b { text-align: right; color: var(--ink-faint); font-weight: 400; font-variant-numeric: tabular-nums; }
+.verb .track { height: 3px; background: #182130; border-radius: 2px; overflow: hidden; }
+.verb .fill { height: 100%; }
+
+.seed-input {
+  /* wide enough for a 10-digit seed, and the native spinner is hidden: it
+     sat on top of the last digit and made 20260927 read as 2026092 */
+  width: 104px;
+  font-family: inherit;
+  font-size: 11px;
+  color: var(--ink);
+  background: #0c1017;
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  padding: 4px 6px;
+  -moz-appearance: textfield;
+  appearance: textfield;
+}
+.seed-input::-webkit-outer-spin-button,
+.seed-input::-webkit-inner-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+.seed-input:focus { outline: none; border-color: #2e4a6b; }
+
+.speed-group { display: flex; gap: 3px; }
+.speed-group button { padding: 4px 8px; font-size: 11px; min-width: 30px; }
+
+.zoombar {
+  position: absolute;
+  bottom: 10px;
+  right: 12px;
+  display: flex;
+  gap: 4px;
+  background: rgba(10, 13, 18, 0.72);
+  padding: 4px;
+  border-radius: 4px;
+}
+.zoombar button { padding: 3px 7px; font-size: 10.5px; min-width: 28px; }
+
+.tabs { display: flex; gap: 3px; margin-bottom: 9px; }
+.tabs button { flex: 1; padding: 4px 0; font-size: 10.5px; }
+
+.kv { display: grid; grid-template-columns: auto 1fr; gap: 3px 10px; font-size: 10.5px; }
+.kv span:nth-child(odd) { color: var(--ink-faint); }
+.kv span:nth-child(even) { color: var(--ink-mid); text-align: right; font-variant-numeric: tabular-nums; }

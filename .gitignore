@@ -1,0 +1,24 @@
+# dependencies
+node_modules/
+
+# next.js build output
+.next/
+out/
+next-env.d.ts.timestamp
+
+# typescript incremental build state
+tsconfig.tsbuildinfo
+*.tsbuildinfo
+
+# local tool state
+.aider.chat.history.md
+.aider.input.history
+.impeccable/
+
+# scratch: diagnostic scripts and screenshots, not part of the project
+scratch/
+
+# environment
+.env
+.env*.local
+.DS_Store
