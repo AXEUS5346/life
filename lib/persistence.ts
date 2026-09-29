@@ -17,7 +17,34 @@ export type SavedWorld = {
   savedAt: number;
   pop: number;
   generation: number;
-  /** the serialised world, as produced by the worker */
+  /**
+   * The serialised world, as produced by the worker. `data` is a JSON string
+   * whose top level carries `version: SNAPSHOT_VERSION`, and that number is
+   * the only thing standing between a save file and a silently wrong animal.
+   *
+   * A snapshot is not a bag of numbers. It records the brain's input count,
+   * its hidden width, its output count and every field that is *interpreted*
+   * rather than merely stored — the verb list, the gene meanings, the item
+   * indices. N_INPUTS alone has gone 45 -> 67, and N_OUTPUTS 16 -> 19 to make
+   * room for gather/drop/combine. Load a v1 world after that change and a
+   * weight vector of 2,368 is read as the first 2,368 of 5,587: not a brain
+   * with bad memories, a different animal with a different set of senses and
+   * three verbs that do not exist yet. Nothing errors. It just behaves like
+   * something that learned on a different world, which is the most expensive
+   * kind of bug to chase because every other number still looks right.
+   *
+   * So: a saved world is loadable ONLY under the same SNAPSHOT_VERSION it was
+   * written with, and under nothing else. The constant lives in
+   * sim/constants.ts rather than here because sim/, worker/ and tests/ all
+   * have to agree on it, and it is the worker's `serialize()` that writes it —
+   * see `SNAPSHOT_VERSION` in worker/sim.worker.ts.
+   *
+   * There is no load path yet. `loadWorld` below fetches a row and returns
+   * the string; nothing in the app hands it to a Sim, and the `load` case in
+   * the worker's message switch is still a placeholder. The version check
+   * belongs at the point a deserialiser is actually written, because a check
+   * on a string nobody parses is a check that never runs.
+   */
   data: string;
 };
 

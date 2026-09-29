@@ -1,5 +1,5 @@
 import {
-  H, Verb, VERB_OUT_BASE, N_MOVE, N_GENES, N_HORMONES,
+  H, Verb, VERB_OUT_BASE, N_MOVE, N_VERB, N_GENES, N_HORMONES,
   DOPAMINE_DECAY, JUVENILE_TICKS, MOVE_DX, MOVE_DY,
 } from './constants.ts';
 import { GENE } from './genome.ts';
@@ -186,7 +186,19 @@ export function hormoneBias(
   lean(out, homeStep, (needHome / top) * 4.0);
 
   const base = VERB_OUT_BASE;
-  out[base + Verb.IDLE] = 0;
+  // Every verb slot is cleared before any of them is written. This function
+  // does not own the buffer: the caller keeps ONE bias array of N_OUTPUTS
+  // floats per agent and reuses it for that agent's whole life, so a slot
+  // nobody writes keeps whatever the last write put there.
+  //
+  // This was invisible at N_VERB=7, where every verb happened to be covered by
+  // a write below, and it became a real cross-contamination the moment the set
+  // stopped being complete — GATHER, DROP and COMBINE were unwritten for a
+  // while, and every pixel in the world inherited the previous pixel's opinion
+  // about picking up a rock. Zeroing the range rather than listing the gaps
+  // means the guarantee is structural: add a verb tomorrow and it starts at
+  // zero for the same reason the others do, without anyone remembering.
+  for (let v = 0; v < N_VERB; v++) out[base + v] = 0;
   out[base + Verb.EAT] = hunger * 3.0 - 0.3;
   out[base + Verb.SEEK_MATE] = a.h(i, H.DESIRE) * sociability * 1.8;
   // MATE, and this is the second line that decides whether a population has a
@@ -207,6 +219,12 @@ export function hormoneBias(
   // noisy argmax, and the brain keeps the only vote that matters, which is
   // the rest of the time.
   out[base + Verb.MATE] = a.h(i, H.DESIRE) * libido * (adjacentMate ? 4.5 : 0.2);
+  // GATHER, DROP and COMBINE keep the zero the loop above gave them, and that
+  // is a decision rather than an omission. Biasing them would be this file
+  // deciding that gathering is worthwhile, which is the question the brain is
+  // being asked; a pixel picks a rock up because the rock turned out to be
+  // worth having, not because something leaned on it.
+  //
   // KILL, and the floor is not a constant because what makes murder rare in
   // this world is that it is only ever the last resort of an animal with
   // nothing left. A flat -2.5 is not rare. The brain's seven verb logits are

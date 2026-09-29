@@ -8,8 +8,11 @@ import {
   DAY_TICKS,
   PRED_DEN_CAP, PRED_DEN_ENERGY, PRED_STARVE_ENERGY,
   PRED_HUNT_R_SMALL, PRED_HUNT_R_LARGE, PRED_MATE_R,
+  PRED_SMELL_MULT, PRED_SMELL_GROWTH,
   MOBS_TO_KILL_SMALL, MOBS_TO_KILL_LARGE,
+  CARRY_CAP,
 } from '@/sim/constants.ts';
+import { PredState } from '@/sim/predators.ts';
 import { EMOTION } from '@/sim/render.ts';
 import type { AgentDetail, PredDetail, PredRow } from '@/worker/sim.worker.ts';
 import type { Stats } from '@/app/page.tsx';
@@ -65,6 +68,35 @@ function clamp01(n: number): number {
   return Math.max(0, Math.min(1, n));
 }
 
+/**
+ * The five behavioural states, in the sidebar's own words.
+ *
+ * The badge used to be a single hunting/den split read off `ranging`, which
+ * cannot tell a stalker from a hunter, or an animal walking home from one
+ * standing over a kill. Those are exactly the four situations a person
+ * watching the map is trying to name, so the sim's own `PredState` is carried
+ * over the wire and printed here rather than reconstructed from two booleans
+ * that cannot tell it apart.
+ */
+const STATE_LABEL: Record<number, string> = {
+  [PredState.RESTING]: 'resting',
+  [PredState.HUNTING]: 'hunting',
+  [PredState.STALKING]: 'stalking',
+  [PredState.FEEDING]: 'feeding',
+  [PredState.RETREAT]: 'retreating',
+};
+
+function stateNote(state: number | undefined): string {
+  switch (state) {
+    case PredState.RESTING: return 'In its den, and not hungry enough to leave it.';
+    case PredState.HUNTING: return 'Out with a target it can currently see, closing at two cells a tick.';
+    case PredState.STALKING: return 'Out, tracking a target it has lost sight of. It closes the last eight cells on the scent rather than the eyes.';
+    case PredState.FEEDING: return 'Standing over a kill or a fresh carcass, eating.';
+    case PredState.RETREAT: return 'Hurt or cornered, heading home for the den.';
+    default: return 'State the simulation did not report.';
+  }
+}
+
 /** -1 is the wire's way of saying "no such thing right now", and for a
  *  predator's mate that is information rather than a missing number. */
 function cells(d: number, none = 'none in range'): string {
@@ -97,6 +129,24 @@ function summary(s: Stats): string {
   }
   if (s.betraysals > 0) {
     parts.push(`${plural(s.betraysals, 'pixel')} ${s.betraysals === 1 ? 'has' : 'have'} abandoned a bonded partner.`);
+  }
+  if (s.carrying > 0) {
+    parts.push(
+      `${plural(s.carrying, 'pixel')} ${s.carrying === 1 ? 'is' : 'are'} carrying something, ` +
+      `out of ${plural(s.rock + s.stick, 'loose item')} on the ground.`,
+    );
+  } else if (s.rock + s.stick > 0) {
+    parts.push(
+      `Nothing is being carried, though there ${s.rock + s.stick === 1 ? 'is' : 'are'} ` +
+      `${plural(s.rock + s.stick, 'loose item')} lying around.`,
+    );
+  }
+  if (s.firesLit > 0) {
+    parts.push(
+      `${plural(s.firesLit, 'fire')} ${s.firesLit === 1 ? 'has' : 'have'} been lit, ` +
+      `${s.fireBurned.toLocaleString()} cells burned, ` +
+      `${s.predBurned > 0 ? `and ${plural(s.predBurned, 'predator')} burned to death.` : 'no predators harmed.'}`,
+    );
   }
   if (totalDeaths > 0) parts.push(`${plural(totalDeaths, 'death')} so far.`);
   return parts.join(' ');
@@ -149,6 +199,7 @@ export function Sidebar({ stats, history, detail }: Props) {
             </div>
 
             <PopBar pop={stats.pop} soft={SOFT_CAP} hard={HARD_CAP} />
+            <Items s={stats} />
             <Predators s={stats} />
             <DeathBlock deaths={stats.deaths} />
             <div className="blk">
@@ -190,6 +241,76 @@ function MapKey() {
           </div>
         ))}
       </div>
+    </div>
+  );
+}
+
+/**
+ * Rock, sticks and fire — the three things a pixel can do to the ground that
+ * is not eat, mate or run.
+ *
+ * These are the counters that decide whether any of the above is happening at
+ * all, and they are here rather than buried in the inspector because the
+ * question they answer is a question about the *world*: is a village
+ * stripping a woodline, is anything carrying anything, has a fire ever been
+ * lit. A world where `carrying` sits at zero while rock and stick counts climb
+ * is a world whose pixels have not learned the one thing these items are for,
+ * and that is worth seeing in a glance rather than inferring from a brain
+ * weight.
+ *
+ * Rock and stick are shown as a pair because they are the two halves of
+ * something the sim has an opinion about and no brain is told — the world
+ * decides what a lump of both is worth when a pixel sets one down. This panel
+ * reports what is lying around and what is being held; it does not say what
+ * the pairing does, because the panel is not allowed to know either.
+ */
+function Items({ s }: { s: Stats }) {
+  const fireOut = s.fireActive === 0 && s.firesLit === 0;
+  return (
+    <div className="blk items">
+      <h3>
+        items &amp; fire
+        <span>{fireOut ? 'nothing has ever been lit' : `${s.fireActive} cell${s.fireActive === 1 ? '' : 's'} alight`}</span>
+      </h3>
+      <div className="grid2">
+        <div className="stat" title="Loose rocks lying on the ground. Rock is deliberately general-purpose — fuel, tool, ammunition, stockpile — and the simulation never tells a pixel which. Scatter lands it beside mountains, so this number measures the scree within reach of a village.">
+          <b>{s.rock.toLocaleString()}</b>
+          <span>rock on the ground</span>
+        </div>
+        <div className="stat" title="Loose sticks on the ground. They land on forest only, so a village that has stripped the woodline next to it drives this down — and it comes back on a regrow, which is what makes scarcity mean something.">
+          <b>{s.stick.toLocaleString()}</b>
+          <span>sticks on the ground</span>
+        </div>
+        <div className="stat" title="Pixels with something in their hands right now. This is the number that says the item system is running rather than just existing: rock on the ground is scenery until an animal picks it up.">
+          <b>{s.carrying.toLocaleString()}</b>
+          <span>pixels carrying</span>
+        </div>
+        <div className="stat" title="How many of the living are carrying something at all, as a share of the population. Zero here with rock on the ground means the hands are never being used.">
+          <b>{s.pop > 0 ? Math.round((s.carrying / s.pop) * 100) : 0}<span className="of">%</span></b>
+          <span>of the population</span>
+        </div>
+        <div className="stat" title="Fires started since the world began. A pixel sets a lump down and the world decides; this is the running count of how many times that has happened.">
+          <b>{s.firesLit.toLocaleString()}</b>
+          <span>fires ever lit</span>
+        </div>
+        <div className="stat" title="Cells currently alight. A cell burns for 30 ticks and spreads to its neighbours downwind, so a rising number is a fire running and a falling one is one going out.">
+          <b>{s.fireActive.toLocaleString()}</b>
+          <span>cells alight</span>
+        </div>
+        <div className="stat" title="Cells fire has consumed. A fire only catches where there is fuel, so this is a measure of the world's biomass being spent.">
+          <b>{s.fireBurned.toLocaleString()}</b>
+          <span>cells burned</span>
+        </div>
+        <div className="stat bad" title="Predators killed by fire. The fire that is supposed to be a tool a pixel found is the thing that ends the other species if the world overplays it — this is the number that says which it turned out to be.">
+          <b>{s.predBurned.toLocaleString()}</b>
+          <span>predators burned</span>
+        </div>
+      </div>
+      <p className="pred-rule">
+        A pixel can hold {CARRY_CAP} things at once. Combining fuses whatever is
+        in hand into one lump and sets it down; what that lump is worth is the
+        world's business, and no brain is told.
+      </p>
     </div>
   );
 }
@@ -299,6 +420,31 @@ function PredRow({ p }: { p: PredRow }) {
         <span title={`How far it can notice a pixel this tick. A ${big ? 'large' : 'small'} predator starts at ${big ? PRED_HUNT_R_LARGE : PRED_HUNT_R_SMALL} cells and searches further the hungrier it gets.`}>
           vision <b>{Math.round(p.vision ?? 0)}</b> cells
         </span>
+        {/* The nose, next to the eyes, and the whole reason it is worth a
+            figure of its own: measured over thousands of hunting samples, 9.6%
+            of hunts used to end with the animal seeing nothing at all and
+            sweeping blind along a remembered heading. Smell is what those
+            hunts stop doing. It is derived from hunger exactly the way vision
+            is — same energy, scaled by PRED_SMELL_MULT and then widened by
+            PRED_SMELL_GROWTH — so a starving animal's nose is visibly the
+            bigger circle and both numbers move together on screen. The
+            numbers are interpolated into the tooltip, not this comment. */}
+        <span title={`How far it can notice a pixel by nose, with no line-of-sight check at all. Same hunger curve as vision, times ${PRED_SMELL_MULT}, plus up to ${PRED_SMELL_GROWTH} cells when it is starving. This is the sim's own number, not a figure computed here.`}>
+          smell <b>{Math.round(p.smell ?? 0)}</b> cells
+        </span>
+        <span title={stateNote(p.state)}>
+          {STATE_LABEL[p.state] ?? 'unknown'}
+        </span>
+        {p.preyAware && (
+          <span title="It found its current target by nose, not by eye. This is the nose earning its keep: the animal walked to something it cannot currently see.">
+            by <b>nose</b>
+          </span>
+        )}
+        {(p.scentT ?? 0) > 0 && (
+          <span title={`Ticks of scent memory left. Non-zero means the animal is walking to where its prey was rather than where it is (${p.scentT} ticks).`}>
+            scent <b>{p.scentT}</b>
+          </span>
+        )}
         <span title={`Distance to the nearest ${male ? 'female' : 'male'} it can see. Past ${PRED_MATE_R} cells it may as well be on another continent.`}>
           mate <b>{cells(p.mateDist ?? -1)}</b>
         </span>
@@ -372,6 +518,18 @@ function PredInspector({ d }: { d: PredDetail }) {
   );
 }
 
+/**
+ * The population bar, divided by HARD_CAP=600.
+ *
+ * SOFT_CAP=200 and HARD_CAP=600 put the soft line at exactly one third, where
+ * the old 40/120 put it at the same place by coincidence. The consequence is
+ * not the ratio but the fill: a world that settles around 110-120 pixels draws
+ * a fifth of the track, where it used to draw all of it, and the bar spends
+ * most of its length showing empty. That is the honest reading — the bar's job
+ * is to say how much room is left, and there is a lot — and the soft-cap tick
+ * at 33% is what makes the difference between "comfortable" and "the survival
+ * roll is now a gamble" visible at a glance.
+ */
 function PopBar({ pop, soft, hard }: { pop: number; soft: number; hard: number }) {
   const pct = Math.min(1, pop / hard);
   const softPct = soft / hard;
@@ -425,7 +583,24 @@ function Chart({ history }: { history: { pop: number; life: number }[] }) {
     const n = history.length;
     const px = (i: number) => (i / (n - 1)) * w;
 
-    // cap line
+    // Cap line, and the y-scale, both divide by HARD_CAP.
+    //
+    // The denominator went from 120 to 600 with SOFT_CAP=200, so this chart
+    // now spends most of its height on a population the world has never
+    // reached. A world that peaks around 110-120 pixels — which is what the
+    // harness measures, and what a world with no fire and a small item system
+    // still does — draws a band along the bottom fifth of the panel, and the
+    // line has lost the shape it had when the cap was close to the ceiling it
+    // was actually reaching.
+    //
+    // It is NOT rescaled. The honest reading of a population chart is the one
+    // that says "here is how much room there is and here is how much of it is
+    // used", and quietly substituting a fitted maximum would turn a cap into a
+    // suggestion — the line would touch the top of the panel at whatever
+    // population happened to be the largest so far, which is the one thing a
+    // cap-line graph must never do. What the reader gets instead is the gap
+    // itself: a wide empty band above a low line is the picture of a world
+    // that is nowhere near its cap, which is the fact worth seeing.
     const capY = h - (HARD_CAP / HARD_CAP) * (h - 4) - 2;
     ctx.strokeStyle = 'rgba(220,38,38,0.45)';
     ctx.setLineDash([2, 3]);

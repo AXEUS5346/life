@@ -1,11 +1,12 @@
 /// <reference lib="webworker" />
 import { Sim } from '../sim/sim.ts';
+import type { Agents } from '../sim/agents.ts';
 import { renderFrame, buildAgentIndex, HORMONE_NAMES } from '../sim/render.ts';
 import {
   GRID_W, GRID_H, GRID_SIZE, VIEW_SIZE, MAX_PREDATORS, MAX_AGENTS,
   N_PARAMS, N_INPUTS, N_HIDDEN, N_OUTPUTS,
   START_PREDATORS, TICK_MS, TICK_HZ,
-  VERB_OUT_BASE, VERB_NAMES,
+  VERB_OUT_BASE, VERB_NAMES, SNAPSHOT_VERSION,
 } from '../sim/constants.ts';
 import { GENE_NAMES } from '../sim/genome.ts';
 import { ticksDue, targetHz } from '../sim/pace.ts';
@@ -35,6 +36,33 @@ export type PredRow = {
   vision: number;
   /** Distance to the nearest predator of the opposite sex it can see, -1. */
   mateDist: number;
+  /** How far it can notice a pixel BY NOSE, in cells.
+   *
+   *  `p.smell(i)` and not a second opinion formed here. The sidebar prints
+   *  this beside the vision figure and the only reason that pair is worth
+   *  reading is that both are the numbers the hunt pass actually used; a
+   *  sidebar that re-derived the radius would be a second, wrong simulation
+   *  of how far the animal can sense, which is precisely the failure this
+   *  panel was rebuilt to stop. Same hunger curve as `vision`, scaled by
+   *  PRED_SMELL_MULT and widened again by PRED_SMELL_GROWTH, so the two
+   *  numbers move together and a starving animal's nose is strictly the
+   *  larger circle. */
+  smell: number;
+  /** Which of the five states the animal is in, as `PredState.*`. The badge
+   *  used to be derived from `ranging` alone, which cannot tell a stalker
+   *  from a hunter or an animal running for its den from one that is eating
+   *  what it killed — and those are the four situations a person watching
+   *  the map is trying to name. */
+  state: number;
+  /** True while the current target was found by nose rather than by eye. The
+   *  constants file measures this: 9.6% of hunts used to end with nothing in
+   *  sight at all, and this flag is how a viewer sees the nose earning its
+   *  keep rather than having to take the claim on trust. */
+  preyAware: boolean;
+  /** Ticks of scent memory left. Non-zero means the animal is walking to
+   *  where its prey was rather than to where its prey is, and the roster
+   *  shows it as a countdown so the two are never confused. */
+  scentT: number;
 };
 
 /** A predator under the cursor. Deliberately not AgentDetail: a predator has
@@ -65,6 +93,12 @@ let speed = 1;
 let agentIndex = new Int32Array(GRID_SIZE);
 let buffer: ArrayBuffer | null = null;
 let scratch = new BrainScratch();
+/** The predator currently under the cursor, or -1. Tracked here rather than
+ *  re-derived per frame from the last `detail` message so that the ring drawn
+ *  on the map and the animal named in the inspector are the same animal: one
+ *  is derived from a message and the other from a field, and a frame drawn
+ *  between the click and the reply must not show a stale one. */
+let selectedPred = -1;
 const lineageNames = new Map<number, string>();
 
 const ctx = self as unknown as DedicatedWorkerGlobalScope;
@@ -94,9 +128,31 @@ function roster(): PredRow[] {
       denDist: sim.predDenDistance(i),
       vision: p.vision(i),
       mateDist: sim.predMateDistance(i),
+      smell: p.smell(i),
+      state: p.state[i],
+      preyAware: p.bySmell[i] === 1,
+      scentT: p.scentT[i],
     });
   }
   return out;
+}
+
+/**
+ * How many pixels are holding something right now.
+ *
+ * `carryCount` rather than a sum of the per-kind rows: the point of the figure
+ * is "how many animals are playing with items at all", and a pixel carrying
+ * four rocks and a pixel carrying one of each are both a pair of hands full.
+ * The per-kind split lives in the inspector, where there is room for it.
+ *
+ * Walked over MAX_AGENTS rather than over the live population because there is
+ * no compact list of live slots to walk — `free` is a stack of the *dead* ones
+ * — and 800 byte reads is not a cost worth an index to avoid.
+ */
+function countCarrying(a: Agents): number {
+  let n = 0;
+  for (let i = 0; i < MAX_AGENTS; i++) if (a.alive[i] && a.carryCount[i] > 0) n++;
+  return n;
 }
 
 function makeWorld(seed: number, startPop: number): void {
@@ -104,6 +160,7 @@ function makeWorld(seed: number, startPop: number): void {
   sim.seedPopulation(startPop);
   sim.seedPredators(START_PREDATORS);
   lineageNames.clear();
+  selectedPred = -1;
   for (let i = 0; i < MAX_AGENTS; i++) {
     lineageNames.set(i, `Px-${(seed % 97) * 1000 + i}`);
   }
@@ -119,10 +176,11 @@ function emitFrame(): void {
   if (!sim) return;
   const ab = ensureBuffer();
   const view = new Uint8ClampedArray(ab);
-  renderFrame(sim, view);
+  renderFrame(sim, view, selectedPred);
   buildAgentIndex(sim, agentIndex);
   const snap = sim.snapshot();
   const food = sim.world.totalFood();
+  const carrying = countCarrying(sim.agents);
   post({
     type: 'frame',
     buffer: ab,
@@ -140,6 +198,32 @@ function emitFrame(): void {
       predMobbed: sim.predators.mobbed,
       predBorn: sim.predators.born,
       meat: Math.round(sim.world.meatTotal),
+      // --- the item and fire counters -------------------------------------
+      // Every one of these is a number the simulation already keeps. None of
+      // them is recomputed here, for the same reason the roster is not: a
+      // sidebar figure derived on the main thread is a second simulation of
+      // the world, and it goes stale the moment the sim ticks. `firesLit` and
+      // `fireBurned` are cumulative, so they only ever go up and a viewer can
+      // see the first fire of a world happen while watching.
+      firesLit: sim.world.firesLit,
+      /** Cells alight right now. Zero is the normal state of a world, which
+       *  is why the renderer can skip its fire pass entirely on a counter
+       *  compare. */
+      fireActive: sim.world.fireActive,
+      fireBurned: sim.world.fireBurned,
+      /** Predators fire has killed. The number that says whether fire is a
+       *  tool the pixels found or a second way for the species to die. */
+      predBurned: sim.world.predBurned,
+      /** Loose rock and sticks lying on the ground, in whole items. A
+       *  harvested woodline comes back on the ITEM_SCATTER_EVERY regrow, and
+       *  these two falling and recovering is the only way a person can watch
+       *  that happen. */
+      rock: Math.round(sim.world.rockTotal),
+      stick: Math.round(sim.world.stickTotal),
+      /** Pixels with anything in their hands. The one item number that is
+       *  not about the world but about the animals: loose rock is scenery
+       *  until somebody picks it up. */
+      carrying: carrying,
       // what was asked for, and what the machine actually delivered. The
       // gap between these two is the honest answer to "is 16x really 16x".
       speed,
@@ -288,6 +372,12 @@ ctx.onmessage = (e: MessageEvent<ToWorker>) => {
       if (msg.cell < 0 || msg.cell >= GRID_SIZE) { post({ type: 'inspect', detail: null }); break; }
       const hit = agentIndex[msg.cell];
       const detail = hit >= 0 ? detailFor(hit) : hit <= -2 ? predDetailFor(-hit - 2) : null;
+      // Clicking empty ground clears the selection, which is what makes the
+      // ring go away. It is set unconditionally rather than only on a
+      // predator hit, so clicking a pixel also clears it — otherwise the ring
+      // would sit over a pixel that was clicked and the two would disagree
+      // about what is selected.
+      selectedPred = hit <= -2 ? -hit - 2 : -1;
       post({ type: 'inspect', detail });
       break;
     }
@@ -310,7 +400,14 @@ function serialize(): string {
   const pack = <T extends Float32Array | Int32Array | Int16Array | Uint8Array | Uint16Array | Int8Array>(arr: T) =>
     Array.from(arr as unknown as ArrayLike<number>);
   return JSON.stringify({
-    version: 1,
+    // SNAPSHOT_VERSION, not a literal. A snapshot records the brain's input
+    // count, its verb count and every field that is interpreted rather than
+    // merely stored, and a world saved under one shape cannot be read under
+    // another: N_INPUTS went 45 -> 67 here, so a v1 weight vector is not an
+    // animal with bad memories, it is a different animal. The number lives in
+    // sim/constants.ts because sim/, worker/ and tests/ all have to agree on
+    // it, and a literal here is how the two drift apart.
+    version: SNAPSHOT_VERSION,
     seed: sim.seed,
     tick: sim.tick,
     brains: pack(sim.brains),

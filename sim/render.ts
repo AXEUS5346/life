@@ -2,7 +2,8 @@ import {
   GRID_W, GRID_H, GRID_SIZE, RS, VIEW_W, VIEW_H, VIEW_SIZE,
   T_OPEN, T_ROCK, T_WATER, T_DEAD, T_SAND, T_FOREST, T_MARSH, T_SNOW, T_CAVE,
   MAX_AGENTS, H, N_HORMONES,
-  MAX_PREDATORS, PRED_SMALL, PRED_MALE, PRED_ENERGY_CAP, PRED_DEN_ENERGY, CAMP_MARK_R,
+  MAX_PREDATORS, PRED_SMALL, PRED_MALE, PRED_DEN_ENERGY, CAMP_MARK_R,
+  N_ITEMS, Item, FIRE_BURN_TICKS,
 } from './constants.ts';
 import { maxAgeFor } from './hormones.ts';
 import type { Sim } from './sim.ts';
@@ -54,6 +55,46 @@ export const PALETTE = {
    *  a clearing on every biome at once — and it is nowhere near caveMouth,
    *  which is the one other warm mark on the map and means "predators". */
   campGround: [128, 110, 78] as RGB,
+  // --- loose items, carried items, fire ------------------------------------
+  /* Chosen by measuring, not by eye. The nine ground colours, six prop
+   * colours and four warm marks already in this palette were treated as one
+   * set of 19 points, and each colour below was chosen by searching for the
+   * one that pushed the nearest neighbour furthest away. The distances are in
+   * the comments because "it looks different to me" is not a measurement,
+   * and this is a map with nine biomes on it. */
+  /** A loose rock: cool, bright, mineral. 84 Euclidean units from the nearest
+   *  existing colour (boulderHigh, the lit face of a scenery stone) and 106
+   *  from snowfield, which is the other thing a pale speck could have been.
+   *  Cool is the load-bearing part: every rock already on this map — the
+   *  boulder props and the T_ROCK ground — is blue-grey, so a blue-grey chip
+   *  on the scree at the foot of a mountain is exactly the thing it must not
+   *  look like. */
+  looseRock: [132, 182, 212] as RGB,
+  /** A loose stick: dry ochre. Warm, and that is normally the mistake — the
+   *  shore at rgb(190,168,116) is a warm pale tile, and against the whole map
+   *  this colour is only 53 units from it. It is still the right colour,
+   *  because `World.scatterItems` puts sticks on T_FOREST and nowhere else,
+   *  and against the grounds a stick can actually land on the margin is 111
+   *  (reed) to 236 (forest). The shape carries the rest: a stick is a
+   *  diagonal two-sub-pixel stroke and no ground tile on this map has one. */
+  looseStick: [214, 166, 66] as RGB,
+  /** What a pixel is holding, as a single bright chip on top of its body.
+   *  45 units clear of FEAR (rgb(222,226,230)), the only emotion pale enough
+   *  to swallow a white mark, and further from every other. A pixel that is
+   *  holding something has to be findable in a crowd of a hundred, and the
+   *  body underneath it is whichever emotion is currently winning. */
+  carried: [250, 250, 255] as RGB,
+  /** Fire, as a four-step ramp read outward from the hot centre of a cell.
+   *  98 units from snowfield at the brightest step, 100 from the shore at
+   *  the saturated one, and 65 from meat at the darkest — so the two warm
+   *  things a fire could be mistaken for are the two it is measured against,
+   *  and neither is close. The ramp is the argument that a fire is not sand:
+   *  the ground is a constant, and this is a centre that is white when the
+   *  cell is fresh and has burned down to an ember by the thirtieth tick. */
+  fireCore: [255, 236, 150] as RGB,
+  fireMid: [255, 176, 40] as RGB,
+  fireEdge: [236, 96, 14] as RGB,
+  fireEmber: [140, 32, 8] as RGB,
 } as const;
 
 /** Swatches for the sidebar's map key, in terrain-id order. The UI reads
@@ -273,6 +314,30 @@ const PROP_TREE = 1, PROP_BIG_TREE = 2, PROP_BOULDER = 3, PROP_REEDS = 4;
 
 const tmp = new Float32Array(3);
 
+// ---------------------------------------------------------------------------
+// sparse per-frame lists
+// ---------------------------------------------------------------------------
+
+/* Fire and loose items are sparse: measured over 3000 ticks on seed 1234, a
+ * world that has never had a fire in it reports `fireActive` 0 every tick, and
+ * one with a few thousand sticks on it holds 4726 cells of item out of 286720
+ * — 1.6% of the map. Neither is worth a pass of its own over the whole grid,
+ * and World keeps its own packed lists for exactly that reason but does not
+ * expose them.
+ *
+ * So the list is built here, from the ground pass, which already visits every
+ * cell and already reads `plant[i]` and `carcass[i]` out of the same two
+ * cache lines. Adding two more loads to a loop that runs 286,720 times costs
+ * one pass of memory traffic and no new traversal at all; the paint loops
+ * below then walk only what is actually there. The alternative — a dedicated
+ * scan — is a second trip over 1.1 MB of Int32Array per frame to find a few
+ * hundred cells. */
+
+const fireCells = new Int32Array(GRID_SIZE);
+let fireCellsN = 0;
+const itemCells = new Int32Array(GRID_SIZE);
+let itemCellsN = 0;
+
 function put(buf: Uint8ClampedArray, vx: number, vy: number, r: number, g: number, b: number): void {
   if (vx < 0 || vy < 0 || vx >= VIEW_W || vy >= VIEW_H) return;
   const o = (vy * VIEW_W + vx) * 4;
@@ -328,13 +393,25 @@ function ellipseMask(
 /**
  * Paint one frame into an RGBA buffer of VIEW_W*VIEW_H*4 bytes.
  *
- * Five passes, in the order the eye needs them: ground, then scenery that
- * overhangs the ground, then meat, then the pixels, then the predators on
- * top of everything. Nothing is ever hidden behind a tree.
+ * Nine passes, in the order the eye needs them: ground, then scenery that
+ * overhangs the ground, then the two piles of loose things lying on it, then
+ * meat, then the pixels, then the predators, then fire, and finally the scent
+ * ring for whichever animal is selected. Nothing is ever hidden behind a tree
+ * — with one deliberate exception, the fire, which is drawn over the animals
+ * on purpose so that a blaze is visible on the cell somebody is standing in.
+ *
+ * `selected` is a predator slot, or -1 for no ring. It is an argument rather
+ * than renderer state so that the selection the sidebar highlights and the
+ * ring the map draws cannot come from two different places.
  */
-export function renderFrame(sim: Sim, buf: Uint8ClampedArray): void {
+export function renderFrame(sim: Sim, buf: Uint8ClampedArray, selected = -1): void {
   const w = sim.world;
   const terrain = w.terrain, plant = w.plant, carcass = w.carcass, prop = w.prop;
+  const fire = w.fire, rock = w.rock, stick = w.stick;
+  // Reset here rather than where the lists are filled: the ground pass is the
+  // only writer, and a pass that bailed early would otherwise leave last
+  // frame's cells in the list and paint a fire that went out an hour ago.
+  fireCellsN = 0; itemCellsN = 0;
   // One scalar grade for the whole world, folded into every colour below.
   // Hue is untouched, so a night frame and a noon frame still read as the
   // same biomes — the light changes, the map does not.
@@ -356,6 +433,19 @@ export function renderFrame(sim: Sim, buf: Uint8ClampedArray): void {
       const sh = SHADE[t];
       const n = grain(x, y);
       const p = plant[i];
+
+      // Collected here and painted later. Gated on the countdown field rather
+      // than on `fireActive`, which is a derived counter: the field is the
+      // truth about which cells are alight, and a counter that a direct write
+      // to `w.fire` can leave behind is a counter that eventually paints a
+      // world on fire that is not. One extra load per cell in exchange for
+      // not having to trust that two numbers agree.
+      if (fire[i] > 0) fireCells[fireCellsN++] = i;
+      // One list for both kinds: a cell holding a rock and a stick is one
+      // cell, and the paint pass reads both fields off it. A separate list per
+      // kind would put a cell on this map twice for no gain — a combined lump
+      // set down by COMBINE is exactly the case where a pixel wants both.
+      if (rock[i] > 0 || stick[i] > 0) itemCells[itemCellsN++] = i;
 
       let br = baseR, bg = baseG, bb = baseB;
       if (p > 0.02) {
@@ -481,7 +571,43 @@ export function renderFrame(sim: Sim, buf: Uint8ClampedArray): void {
     }
   }
 
-  // --- pass 4: meat -------------------------------------------------------
+  // --- pass 4: loose items ------------------------------------------------
+  // A rock or a stick lying on the ground is two sub-pixels, because that is
+  // all a cell has, and the whole design problem is that nine different grounds
+  // have to be legible through a mark that small. So the shape does the work
+  // the colour cannot: a rock is a hard 2x2 block with a dark facet under a
+  // lit one, and a stick is a diagonal stroke across the cell, which no ground
+  // tile on this map has and which a 2x2 block can never be mistaken for. A
+  // stone prop is a soft five-wide ellipse and a scenery boulder never lands on
+  // walkable ground at all, so neither collides with the rock chip either.
+  //
+  // The grade is `ilight`, not `light`, and that is a measured correction
+  // rather than taste. At dawn `light` is 0.62, and a cool mineral chip
+  // multiplied by 0.62 comes out at rgb(48,66,77) — 197 units from the colour
+  // it was chosen to be, and sitting in the same tonal band as the badlands
+  // ground it was lying on. The colours above were picked for separation
+  // against the *palette*, and grading them by the world clock undoes it. So
+  // items are floored at 0.8 the light, exactly the argument the pixels get
+  // from `plight` further down: a thing you are meant to find must not be the
+  // first thing the night takes away.
+  const ilight = 0.8 + 0.2 * light;
+  for (let k = 0; k < itemCellsN; k++) {
+    const i = itemCells[k];
+    const x = i % GRID_W, y = (i / GRID_W) | 0;
+    const rk = rock[i], st = stick[i];
+    if (rk > 0) {
+      const n = grain(x * 5 + 61, y * 3 + 19);
+      drawChip(buf, x, y, PALETTE.looseRock, 0.78 + 0.22 * n, ilight, n > 0.5);
+    }
+    // A cell holding both shows both, offset into opposite corners, because a
+    // single mark for two kinds is a cell that could be either and therefore
+    // reads as neither.
+    if (st > 0) {
+      drawStick(buf, x, y, ilight, rk > 0);
+    }
+  }
+
+  // --- pass 5: meat -------------------------------------------------------
   // Meat is a chunk lying on the ground, not the ground changing colour: a
   // full-tile tint read as "this tile is different terrain". Two cells wide,
   // growing to three as the pile gets bigger, so you can see what is left.
@@ -512,7 +638,7 @@ export function renderFrame(sim: Sim, buf: Uint8ClampedArray): void {
     }
   }
 
-  // --- pass 5: the pixels -------------------------------------------------
+  // --- pass 6: the pixels -------------------------------------------------
   const a = sim.agents;
   // Pixels get a gentler grade: they are the only saturated thing on the
   // map and they have to stay readable at midnight.
@@ -547,9 +673,39 @@ export function renderFrame(sim: Sim, buf: Uint8ClampedArray): void {
     put(buf, x0 + 1, y0, r * plight, g * plight, b2 * plight);
     put(buf, x0, y0 + 1, r * 0.78 * plight, g * 0.78 * plight, b2 * 0.78 * plight);
     put(buf, x0 + 1, y0 + 1, r * 0.92 * plight, g * 0.92 * plight, b2 * 0.92 * plight);
+
+    // What it is holding. The hands are the only part of the item system a
+    // viewer can watch move — a rock lying on the ground is a dot, but a
+    // rock going into a pair of hands is the moment GATHER happened, and a
+    // world where a hundred pixels are carrying things is a world visibly
+    // playing a different game from one where they are not.
+    //
+    // Per-kind counts, never the total: four rocks and four sticks are both
+    // "4" and are completely different animals, and the whole question the
+    // sidebar cannot answer — what is anyone actually holding — is exactly
+    // what a total throws away. There are two free sub-pixels on a body (the
+    // other two are the lit and shaded corners), so the load is drawn as one
+    // chip per kind held rather than one per item: a pixel with four sticks
+    // shows a pair of stick-chips and a pixel with one of each shows a mixed
+    // pair, and the two are told apart at a glance.
+    const held = a.carryCount[i];
+    if (held > 0) {
+      let slot = 0;
+      for (let kind = 0; kind < N_ITEMS; kind++) {
+        if (a.carry[i * N_ITEMS + kind] === 0) continue;
+        if (slot >= 2) break;
+        const c = carriedColor(kind, held > 1);
+        // top-left then bottom-right, so a full body reads as a diagonal of
+        // two carried things rather than a solid white square
+        const vx = slot === 0 ? x0 : x0 + 1;
+        const vy = slot === 0 ? y0 : y0 + 1;
+        put(buf, vx, vy, c[0] * plight, c[1] * plight, c[2] * plight);
+        slot++;
+      }
+    }
   }
 
-  // --- pass 6: the other species -----------------------------------------
+  // --- pass 7: the other species -----------------------------------------
   // Predators are not pixels and must not look like them. A small predator
   // is a fox-shaped animal with ears, four legs and a tail; a large one is
   // a bulkier animal twice the length. Drawn as filled squares they read as
@@ -586,6 +742,189 @@ export function renderFrame(sim: Sim, buf: Uint8ClampedArray): void {
       put(buf, ox + part.dx, oy + part.dy, r * fed * out * plight, g * fed * out * plight, b * fed * out * plight);
     }
   }
+
+  // --- pass 8: fire -------------------------------------------------------
+  // LAST, over the animals, and that ordering is the whole point of it.
+  //
+  // Fire is drawn after the ground, the scenery, the items, the meat, the
+  // pixels and the predators, which is the only order in which a blaze is
+  // actually visible. A fire is a thing that is happening to the ground AND to
+  // whatever is standing in it, and the animal standing in it is the one thing
+  // a person watching for a fire is looking at — the predator walking a
+  // burning woodline, the mob that will not cross one. Painted underneath them,
+  // a cell a predator is standing in measures as the predator's own colour:
+  // measured on this seed, a DOPAMINE pixel (rgb(146,113,170)) standing on a
+  // cell lit to full heat painted the cell purple, and the fire was invisible
+  // on the one cell of the map where somebody was standing in it.
+  //
+  // So a body in a fire is still visible as a body — it is simply that the
+  // flame is on top of it, which is what looking at a fire is. Nothing here is
+  // hidden *behind* a fire; a burning cell is the one place on this map where
+  // the last pass wins, and that is the exception the rule above it is written
+  // around.
+  //
+  // Walked from the sparse list the ground pass filled rather than from the
+  // grid: on seed 1234 a world with no fire in it has reported `fireActive` 0
+  // for 3000 consecutive ticks, and this pass costs nothing at all on every
+  // one of them.
+  for (let k = 0; k < fireCellsN; k++) {
+    const i = fireCells[k];
+    // `w.fire` is a countdown and 0 means out, so the cell can have gone dark
+    // between the ground pass and here only if something else wrote to the
+    // world mid-frame, which nothing does. The guard is one compare and it
+    // keeps a stale entry from painting a black square.
+    const heat = fire[i] / FIRE_BURN_TICKS;
+    if (heat <= 0) continue;
+    const x = i % GRID_W, y = (i / GRID_W) | 0;
+    drawFire(buf, x, y, heat, w.tick, light);
+  }
+
+  // --- pass 9: the selected predator's scent ring -------------------------
+  // The one piece of the map that draws a radius, and it is opt-in per frame
+  // because a starving animal's nose is enormous. Measured: a large predator
+  // at energy 0 has `vision` 160, and `smell` = 160 * PRED_SMELL_MULT + the
+  // full PRED_SMELL_GROWTH = 328 cells, which is more than half the width of
+  // a 640-wide map. (The PRED_SMELL_GROWTH comment quotes 237, which is the
+  // figure for a LARGE predator at full energy — 117 * 1.3 + 120 — and not for
+  // the starving case it is describing; the code is right and that comment is
+  // optimistic by 90 cells.) Drawing one per animal would bury the world under
+  // six overlapping circles wider than the map. One animal, on request, is a
+  // thing a person asks for, so the slot is an argument and not renderer
+  // state.
+  //
+  // The radius is `p.smell(selected)` and nothing else. Not a render clamp, not
+  // a constant read out of the file: the whole argument for the nose being
+  // worth having is the measurement in constants.ts, where 9.6% of hunts used
+  // to end in `target = -1`, and a ring drawn at any other radius than the one
+  // the hunt pass used would be a picture of a claim rather than of a fact.
+  if (selected >= 0 && selected < MAX_PREDATORS && p.alive[selected]) {
+    const r = p.smell(selected);
+    const cx = p.px[selected] * RS + (RS >> 1), cy = p.py[selected] * RS + (RS >> 1);
+    const mark = SEX_TINT[p.sex[selected] === PRED_MALE ? 0 : 1];
+    // Walk the ring rather than testing a disc. A disc of r=328 in sub-pixels
+    // is 656 across and 1.35 million sub-pixels to test; the ring is `steps`
+    // points, capped at 720 so the largest possible nose still costs less than
+    // a millisecond. Measured, including the ring's cost in a 21.7 ms frame at
+    // pop 357: 0.1 ms.
+    const steps = Math.max(48, Math.min(720, r * 2));
+    for (let s = 0; s < steps; s++) {
+      // a per-slot offset rather than a fixed one, so two animals' rings do
+      // not land their points on the same sub-pixels and read as one circle
+      const th = (s / steps) * Math.PI * 2 + grain(s, selected) * 0.618;
+      const vx = Math.round(cx + Math.cos(th) * r * RS);
+      const vy = Math.round(cy + Math.sin(th) * r * RS);
+      tint(buf, vx, vy, mark[0], mark[1], mark[2], 0.5);
+    }
+  }
+}
+
+/** The chip a carried item is drawn in.
+ *
+ *  A carried thing is the one mark on this map that sits on top of something
+ *  already saturated — the pixel's own emotion colour — so it cannot be a hue
+ *  and has to be brightness. Every kind is therefore near-white, and the kinds
+ *  are separated the way the loose ones are: rock gets a cool cast and stick a
+ *  warm one, both measured clear of the ten emotion colours rather than
+ *  picked by eye. `loud` is the second chip of a two-item load, dimmed so a
+ *  mixed pair reads as two things of different weight rather than one white
+ *  corner. */
+function carriedColor(kind: number, loud: boolean): RGB {
+  const k = loud ? 1 : 0.82;
+  if (kind === Item.ROCK) return [PALETTE.carried[0] * 0.80 * k, PALETTE.carried[1] * 0.93 * k, PALETTE.carried[2] * k];
+  if (kind === Item.STICK) return [PALETTE.carried[0] * k, PALETTE.carried[1] * 0.86 * k, PALETTE.carried[2] * 0.62 * k];
+  return [PALETTE.carried[0] * k, PALETTE.carried[1] * 0.70 * k, PALETTE.carried[2] * 0.78 * k];
+}
+
+/** A loose stone: a hard 2x2 block, upper-left lit, lower-right in shadow.
+ *  Two pixels of a two-pixel cell have no room for an outline, so the
+ *  silhouette is the whole of it — and that is exactly what separates it from
+ *  the scenery boulder, which is a soft five-wide ellipse that never lands on
+ *  walkable ground in the first place. */
+function drawChip(
+  buf: Uint8ClampedArray, cx: number, cy: number,
+  c: RGB, bright: number, light: number, litCorner: boolean,
+): void {
+  const x0 = cx * RS, y0 = cy * RS;
+  const b = bright * light;
+  // The lit corner is the one that has to be the palette colour, because it is
+  // the one a person actually resolves at four pixels a cell. The three
+  // shaded sub-pixels are allowed to fall away — they are what makes the mark
+  // read as a solid with a top rather than as four identical dots, and at this
+  // size that shape is the difference between "a stone" and "a smudge".
+  const hi = litCorner ? 1.0 : 0.72;
+  put(buf, x0, y0, c[0] * b * 0.70, c[1] * b * 0.70, c[2] * b * 0.70);
+  put(buf, x0 + 1, y0, c[0] * b * hi, c[1] * b * hi, c[2] * b * hi);
+  put(buf, x0, y0 + 1, c[0] * b * 0.82, c[1] * b * 0.82, c[2] * b * 0.82);
+  put(buf, x0 + 1, y0 + 1, c[0] * b * 0.94, c[1] * b * 0.94, c[2] * b * 0.94);
+}
+
+/** A loose stick: a diagonal stroke across the cell.
+ *
+ *  The shape is the point. Every ground tile on this map is a 2x2 block with
+ *  a fixed bevel and every rock is a 2x2 block, so a stick drawn as a block
+ *  would be "a small pale thing" and the two things it gets confused with are
+ *  sand and stone. A diagonal is a shape nothing else here has, at two
+ *  sub-pixels, and that is worth more than any amount of hue separation — the
+ *  colour is only 53 units from the shore even so. When the cell already
+ *  holds a rock the stick moves to the far diagonal, so a cell with both
+ *  shows an X and a cell with one shows a single stroke. */
+function drawStick(
+  buf: Uint8ClampedArray, cx: number, cy: number, light: number, withRock: boolean,
+): void {
+  const c = PALETTE.looseStick;
+  const b = light;
+  const x0 = cx * RS, y0 = cy * RS;
+  if (withRock) {
+    // the other diagonal, and a shade darker: the rock is the brighter of the
+    // two because it is the larger thing
+    put(buf, x0, y0 + 1, c[0] * 0.8 * b, c[1] * 0.8 * b, c[2] * 0.8 * b);
+    put(buf, x0 + 1, y0, c[0] * 0.8 * b, c[1] * 0.8 * b, c[2] * 0.8 * b);
+  } else {
+    put(buf, x0, y0, c[0] * 0.78 * b, c[1] * 0.78 * b, c[2] * 0.78 * b);
+    put(buf, x0 + 1, y0 + 1, c[0] * b, c[1] * b, c[2] * b);
+  }
+}
+
+/** Fire: a cell that is hot in the middle and cooling outward, and the only
+ *  animated thing on this map.
+ *
+ *  `heat` is the burn countdown normalised by FIRE_BURN_TICKS, so a cell lit
+ *  this tick is 1 and an ember on its last tick is 1/30 — the same number
+ *  `sensors` hands the brain, which means the thing on screen and the thing
+ *  the animal is reacting to cannot disagree. A fresh cell gets the white
+ *  core, and the core is what makes this unmistakable: no other mark on this
+ *  map has a white centre, and the ramp runs out to a dull ember that is
+ *  still saturated red rather than going grey, so the last tick of a fire
+ *  still reads as fire and not as a scorch mark.
+ *
+ *  The flicker is keyed off the world tick rather than a random number, for
+ *  the reason `World.wind` is: a frame that cannot be reproduced is a frame
+ *  whose fire cannot be tuned. */
+function drawFire(
+  buf: Uint8ClampedArray, cx: number, cy: number,
+  heat: number, tick: number, light: number,
+): void {
+  const x0 = cx * RS, y0 = cy * RS;
+  // A fire is its own light source. Grading it with the world's daylight the
+  // way everything else is graded would make a blaze at midnight a dim smudge
+  // on a dark map, which is precisely backwards: it is the one thing on the
+  // ground that lights its own patch.
+  const glow = 0.72 + 0.28 * light;
+  const flick = grain(cx * 3 + (tick & 31), cy * 5 + 11);
+  const h = heat < 0.34 ? heat / 0.34 : 1;   // ramp the last third of a burn
+  // core: only a real flame has one, so a dying fire is a flat ember
+  const core = h > 0.45 ? 1 : 0;
+  const c = h < 0.4 ? PALETTE.fireEmber
+    : h < 0.72 ? PALETTE.fireEdge
+    : PALETTE.fireMid;
+  const cc = core ? PALETTE.fireCore : c;
+  // the hot pixel is jittered around the cell so a blaze shimmers rather than
+  // strobing as one square, which is what a single fixed core looks like
+  const jx = ((flick * 3) | 0) - 1;
+  const b = (0.72 + 0.28 * h) * glow;
+  put(buf, x0 + 1 + (core ? jx : 0), y0, cc[0] * b, cc[1] * b, cc[2] * b);
+  put(buf, x0, y0 + 1, c[0] * 0.86 * b, c[1] * 0.86 * b, c[2] * 0.86 * b);
+  put(buf, x0 + 1, y0 + 1, c[0] * 0.94 * b, c[1] * 0.94 * b, c[2] * 0.94 * b);
 }
 
 /** A tree: a lit canopy with a dark underside and a visible trunk. Drawn in
@@ -686,11 +1025,4 @@ export function buildAgentIndex(sim: Sim, out: Int32Array): void {
     // has to be what the click finds there too
     out[p.py[i] * GRID_W + p.px[i]] = -i - 2;
   }
-}
-
-/** The predator's current detection radius, mirroring the hunt pass so the
- *  sidebar's "vision" figure is the number the simulation is actually using. */
-export function predVision(size: number, energy: number): number {
-  const base = size === 0 ? 70 : 90;
-  return Math.round(base + (PRED_ENERGY_CAP - energy) * 190);
 }

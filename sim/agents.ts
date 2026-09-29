@@ -1,4 +1,4 @@
-import { MAX_AGENTS, N_HORMONES, N_GENES, GRID_W, GRID_H } from './constants.ts';
+import { MAX_AGENTS, N_HORMONES, N_GENES, N_ITEMS, CARRY_CAP, GRID_W, GRID_H } from './constants.ts';
 import { RNG } from './rng.ts';
 import { randomGenome } from './genome.ts';
 
@@ -52,6 +52,23 @@ export class Agents {
   campY = new Int32Array(MAX_AGENTS);
   bornTick = new Int32Array(MAX_AGENTS);
 
+  // --- hands ---------------------------------------------------------------
+  /* The same flat addressing as `genes` and `horm` above — one row of N_ITEMS
+   * per slot, indexed i * N_ITEMS + kind — because a pixel holds a handful of
+   * things at once and three separate MAX_AGENTS-long arrays would make the
+   * count a three-argument sum at every call site that wants to know how full
+   * these hands are. */
+  /** How many of each item kind this pixel holds, indexed by Item.*. */
+  carry = new Uint8Array(MAX_AGENTS * N_ITEMS);
+  /** Total in hand across all kinds — the capacity check without a sum. */
+  carryCount = new Uint8Array(MAX_AGENTS);
+  /** Ticks before this pixel will gather again. */
+  gatherT = new Int32Array(MAX_AGENTS);
+  /** Ticks before this pixel will combine again. */
+  combineT = new Int32Array(MAX_AGENTS);
+  /** How many separate combines this pixel has performed (sidebar). */
+  combines = new Int32Array(MAX_AGENTS);
+
   /** free slots, used as a stack */
   free: number[] = [];
   count = 0;
@@ -63,6 +80,43 @@ export class Agents {
 
   g(i: number, gene: number): number { return this.genes[i * N_GENES + gene]; }
   h(i: number, hormone: number): number { return this.horm[i * N_HORMONES + hormone]; }
+  carrying(i: number, kind: number): number { return this.carry[i * N_ITEMS + kind]; }
+  carryingTotal(i: number): number { return this.carryCount[i]; }
+  /** How much more this pixel can pick up. Negative would mean Sim has let the
+   *  hands overflow, which `addCarry` refuses to do; it is deliberately not
+   *  clamped to zero here, because a number that can go negative is how an
+   *  overflow gets noticed instead of quietly becoming a bigger number. */
+  carryRoom(i: number): number { return CARRY_CAP - this.carryCount[i]; }
+
+  /**
+   * Put up to `n` of one kind in this pixel's hands and report how much fitted.
+   *
+   * The return value is the whole point of the method: a gather that finds two
+   * rocks into one free hand has to leave the second on the ground, and the
+   * caller cannot work that out from a boolean because the rock it failed to
+   * pick up is still sitting there in a world that keeps decaying.
+   *
+   * The counts are whole things. A hand holds a thing or it holds nothing,
+   * which is why this is a Uint8Array of counts and not a Float32Array of
+   * nutrition — a fraction of a lump exists only at the moment it is eaten.
+   */
+  addCarry(i: number, kind: number, n: number): number {
+    const room = CARRY_CAP - this.carryCount[i];
+    if (room <= 0 || n <= 0) return 0;
+    const took = n < room ? n : room;
+    this.carry[i * N_ITEMS + kind] += took;
+    this.carryCount[i] += took;
+    return took;
+  }
+
+  /** Empty the hands. Clears the total as well as the row, which is the half
+   *  that gets forgotten: the row is N_ITEMS long and the total is not, so
+   *  zeroing one of them leaves a pixel that has nothing in its hands and a
+   *  capacity check that thinks it is full. */
+  clearCarry(i: number): void {
+    this.carry.fill(0, i * N_ITEMS, (i + 1) * N_ITEMS);
+    this.carryCount[i] = 0;
+  }
 
   setH(i: number, hormone: number, v: number): void {
     const idx = i * N_HORMONES + hormone;
@@ -92,6 +146,12 @@ export class Agents {
     this.desperation[i] = 0;
     this.starveT[i] = 0;
     this.killT[i] = 0;
+    // newborn holds nothing and has never combined anything; release() has
+    // already cleared these, and this is the same belt as that braces
+    this.clearCarry(i);
+    this.gatherT[i] = 0;
+    this.combineT[i] = 0;
+    this.combines[i] = 0;
     randomGenome(rng, this.genes.subarray(i * N_GENES, (i + 1) * N_GENES));
     this.gen[i] = 0;
     this.founder[i] = i;
@@ -114,6 +174,16 @@ export class Agents {
     }
     this.mate[i] = -1;
     this.deathCause[i] = 0;
+    // Everything that belongs to the animal rather than to the slot. The free
+    // list hands this slot to the next newborn, and a slot that keeps the dead
+    // one's rock gives the newborn a rock it never picked up, a sidebar that
+    // reports combines nobody performed, and a gather cooldown that has already
+    // partly expired. None of those fail loudly; they just make the new animal
+    // behave like the old one.
+    this.clearCarry(i);
+    this.gatherT[i] = 0;
+    this.combineT[i] = 0;
+    this.combines[i] = 0;
     this.free.push(i);
   }
 

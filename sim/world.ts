@@ -9,6 +9,8 @@ import {
   FOOD_CELL, FOOD_BUCKETS, FOOD_BUCKETS_X, FOOD_BUCKETS_Y, FOOD_FIELD_EVERY,
   FOOD_UNDERFOOT,
   CAMP_HOME_R,
+  Item,
+  ITEM_SCATTER_EVERY, FIRE_WIND_TURNS_EVERY,
 } from './constants.ts';
 import { RNG } from './rng.ts';
 
@@ -84,7 +86,7 @@ function makeNoise(rng: RNG) {
   };
 }
 
-export type DeathCause = 'starvation' | 'dehydration' | 'age' | 'crowding' | 'killed';
+export type DeathCause = 'starvation' | 'dehydration' | 'age' | 'crowding' | 'killed' | 'burned';
 
 export class World {
   terrain = new Uint8Array(GRID_SIZE);
@@ -99,6 +101,55 @@ export class World {
   /** Running total of meat in the world, so decay can skip the whole map
    *  when there is none — which is most of the time. */
   meatTotal = 0;
+
+  /** Loose rock, 0..CARRY_CAP per cell. Deliberately general-purpose: what a
+   *  lump of rock is good for is not decided here and is not decided anywhere
+   *  a brain can read. `Sim.maybeIgnite` is the world's opinion, and the
+   *  opinion is about the lump that was set down, not about the pixel that
+   *  carried it. */
+  rock = new Float32Array(GRID_SIZE);
+  /** Loose sticks. Fuel by reputation only — the pixels have to find that out. */
+  stick = new Float32Array(GRID_SIZE);
+  /** Running totals, so regrow and render can skip the whole map when there is
+   *  none. Same reason as `meatTotal`. */
+  rockTotal = 0;
+  stickTotal = 0;
+  /** Cells that hold at least one item, packed at the front. Sparse because a
+   *  full map pass is 0.528 ms against 0.3-10.2 us for the walk that is the
+   *  only thing that runs every tick; the 1.15 MB is the cheaper half of that
+   *  trade and it is a deliberate one, not an oversight. */
+  private itemList = new Int32Array(GRID_SIZE);
+  private itemCount = 0;
+  /** Which of the two item kinds a listed cell holds, parallel to `itemList`.
+   *  Without it a regrow pass has to re-test both arrays to know which of them
+   *  to credit, and the cell is then visited twice for one number. */
+  private itemKind = new Uint8Array(GRID_SIZE);
+
+  /** Ticks of burning left on a cell; 0 means not alight. A countdown and not
+   *  a boolean because `sensors` reads it as intensity: FIRE_BURN_TICKS
+   *  normalises a cell lit this tick to 1 and an ember to a small fraction. */
+  fire = new Int32Array(GRID_SIZE);
+  /** Burnable mass standing on a cell. Gating spread on this is the only thing
+   *  that stops a fire being a world-ending button — see `flammable`. */
+  fireFuel = new Float32Array(GRID_SIZE);
+  /** How many cells are alight, so the fire pass is skipped entirely on the
+   *  overwhelming majority of ticks: a world with no fire in it is the normal
+   *  state, and it should cost one integer compare to discover that. */
+  fireActive = 0;
+  /** Cells alight, packed at the front. The second half of the same trade as
+   *  `itemList`. */
+  private fireList = new Int32Array(GRID_SIZE);
+  private fireCount = 0;
+  /** Tallies, for the sidebar and the harness. Fires a pixel set alight,
+   *  cells a fire consumed, and predators a fire killed. */
+  firesLit = 0;
+  fireBurned = 0;
+  predBurned = 0;
+  /** Index into D4X/D4Y — the direction a fire spreads downwind. Derived from
+   *  the tick counter and never from Math.random(), because a world that is
+   *  not reproducible is a world whose balance cannot be measured. */
+  wind = 0;
+
   /** Only fertile ground grows food. This is what makes a vast world scarce. */
   fertile = new Uint8Array(GRID_SIZE);
   private fertileList = new Int32Array(GRID_SIZE);
@@ -115,6 +166,11 @@ export class World {
   caveX: number[] = [];
   caveY: number[] = [];
   caveDist = new Int32Array(GRID_SIZE);
+  /** One walking-distance field per den, indexed by den. `caveDist` above is
+   *  distance to the *nearest* den, which is the right answer for "how far am
+   *  I from home" and the wrong answer for "how do I walk to den 4" — see
+   *  `caveStep`. */
+  denDist: Int32Array[] = [];
 
   /**
    * Coarse food field: total grass in each FOOD_CELL square.
@@ -145,6 +201,10 @@ export class World {
 
   constructor(seed: number) {
     this.seed = seed;
+    // Derived from the seed rather than shared, so the item scatter is the
+    // same layout on every run of the same seed no matter what else draws
+    // from the generator.
+    this.scatterRng = new RNG((seed ^ 0x17e5a31) >>> 0);
     this.generate(new RNG(seed));
   }
 
@@ -241,10 +301,30 @@ export class World {
 
     this.buildFertility();
     this.buildProps(rng);
+    this.buildFuel();
     this.sowReserve(rng, FOOD_RESERVE);
+    this.scatterItems(rng, true);
     this.buildWaterField();
     this.findCaves();
     this.rebuildFoodField();
+  }
+
+  /**
+   * How much a cell can burn.
+   *
+   * Taken from the world's own biomass, exactly as diag28 measured it: a cell
+   * holds what is growing on it plus a unit of standing wood where there are
+   * trees. That is what makes the fire general without being a weapon — the
+   * world does not decide which plants are for burning, it just says what is
+   * on the cell, and a fire eats down whatever it lit and then cannot pass
+   * into bare ground.
+   *
+   * Water holds nothing, which is the only firebreak the map has. */
+  private buildFuel(): void {
+    for (let i = 0; i < GRID_SIZE; i++) {
+      if (this.terrain[i] === T_WATER) continue;
+      this.fireFuel[i] = this.plant[i] + (this.terrain[i] === T_FOREST ? 1.4 : 0);
+    }
   }
 
   /**
@@ -392,10 +472,36 @@ export class World {
     // six times — which is a place, not a habitat. So the map is cut into a
     // coarse lattice and each region contributes its single best site: six
     // dens in six different places, each on a real wall.
-    const COLS = 3, ROWS = 2;
+    // A den is only a den if you can walk out of it. Carving hollows a
+    // chamber into the rock behind the mouth, which is safe, but the *mouth*
+    // is chosen from any passable cell with rock on one side — including a
+    // cell in a pocket the rest of the map cannot reach. A den there is a
+    // prison: the animal is shut in for the whole run, it can see the
+    // village eight cells away through the mountain, and it kills nothing
+    // ever. Measured, every seed has at least one: on 12, two of the six
+    // were sealed, 241 and 282 cells of floor, and the opening predators
+    // were put in one of them — 5,216 hunting ticks, zero kills, and the
+    // species dead by t=2000. Only sites in the main body of walkable
+    // ground are considered, and carving only ever adds floor, so a den
+    // chosen this way cannot end up sealed.
+    const open = this.mainWalkable();
+    const reachable = cand.filter(c => open[this.idx(c.x, c.y)] === 1);
+
+    // The lattice is COLS x ROWS and must have COLS * ROWS >= N_CAVES, or the
+    // dens all pile into whichever cells happen to come first in Map order —
+    // which is what a hardcoded 3x2 did the moment N_CAVES dropped from six to
+    // four: every world generated put all four dens in the two right-hand
+    // columns, and three quarters of the map had no predator at all.
+    //
+    // Four dens on a 640x448 map is two by two, and the quadrant measurement is
+    // the argument for keeping it that way: sampling the best candidate site
+    // per quadrant gives 15/15/15/15 usable sites on a world that used to give
+    // 23/12/22/3, so a quadrant can be empty (and then the fallback below
+    // places it) but two are never adjacent to a mountain big enough to seal.
+    const COLS = Math.ceil(Math.sqrt(N_CAVES)), ROWS = Math.ceil(N_CAVES / COLS);
     const cw = GRID_W / COLS, chh = GRID_H / ROWS;
     const best = new Map<string, { x: number; y: number; score: number }>();
-    for (const c of cand) {
+    for (const c of reachable) {
       const key = `${Math.min(COLS - 1, (c.x / cw) | 0)}:${Math.min(ROWS - 1, (c.y / chh) | 0)}`;
       const cur = best.get(key);
       if (!cur || c.score > cur.score) best.set(key, c);
@@ -419,6 +525,81 @@ export class World {
       }
     }
     this.buildCaveField();
+    this.buildDenFields();
+  }
+
+  /**
+   * One walking-distance field per den, built once.
+   *
+   * `caveStep` used to descend `caveDist` — the distance to the nearest den —
+   * which was enough for the only thing it was ever asked: walk home, where
+   * home is the den you are already closest to. The moment it was asked to
+   * walk to a *particular* den it stopped working, because from inside a den
+   * that gradient is already zero and no neighbour scores better than zero.
+   * Measured: a predator 204 cells from the den it had been told to move to
+   * sat on its own rock for fifteen hundred ticks, and the relocation meant to
+   * rescue it answered "stay" on every single one of them.
+   *
+   * Six fields, one BFS each, once, at generation.
+   */
+  private buildDenFields(): void {
+    const q = new Int32Array(GRID_SIZE);
+    for (let den = 0; den < this.caveX.length; den++) {
+      const f = new Int32Array(GRID_SIZE).fill(-1);
+      const start = this.idx(this.caveX[den], this.caveY[den]);
+      f[start] = 0;
+      let head = 0, tail = 0;
+      q[tail++] = start;
+      while (head < tail) {
+        const i = q[head++];
+        const x = i % GRID_W, y = (i / GRID_W) | 0;
+        const d = f[i] + 1;
+        for (let k = 0; k < 4; k++) {
+          const nx = x + (k === 0 ? 1 : k === 1 ? -1 : 0);
+          const ny = y + (k === 2 ? 1 : k === 3 ? -1 : 0);
+          if (nx < 0 || ny < 0 || nx >= GRID_W || ny >= GRID_H) continue;
+          const j = this.idx(nx, ny);
+          if (f[j] !== -1) continue;
+          if (this.terrain[j] === T_ROCK) continue;
+          f[j] = d;
+          q[tail++] = j;
+        }
+      }
+      this.denDist.push(f);
+    }
+  }
+
+  /**
+   * A 1 on every cell in the largest connected body of walkable ground, 0
+   * everywhere else. Pockets of three cells behind a cliff are walkable and
+   * reach nothing; this is how the den sites avoid them.
+   */
+  private mainWalkable(): Uint8Array {
+    const out = new Uint8Array(GRID_SIZE);
+    const comp = new Int32Array(GRID_SIZE).fill(-1);
+    const q = new Int32Array(GRID_SIZE);
+    let best = -1, bestSize = 0, n = 0;
+    for (let s = 0; s < GRID_SIZE; s++) {
+      if (comp[s] !== -1 || this.terrain[s] === T_ROCK) continue;
+      let head = 0, tail = 0, size = 0;
+      q[tail++] = s; comp[s] = n;
+      while (head < tail) {
+        const i = q[head++]; size++;
+        const x = i % GRID_W, y = (i / GRID_W) | 0;
+        for (let k = 0; k < 4; k++) {
+          const nx = x + (k === 0 ? 1 : k === 1 ? -1 : 0);
+          const ny = y + (k === 2 ? 1 : k === 3 ? -1 : 0);
+          if (nx < 0 || ny < 0 || nx >= GRID_W || ny >= GRID_H) continue;
+          const j = this.idx(nx, ny);
+          if (comp[j] !== -1 || this.terrain[j] === T_ROCK) continue;
+          comp[j] = n; q[tail++] = j;
+        }
+      }
+      if (size > bestSize) { bestSize = size; best = n; }
+      n++;
+    }
+    for (let i = 0; i < GRID_SIZE; i++) if (comp[i] === best) out[i] = 1;
+    return out;
   }
 
   /** Open a mouth and hollow a chamber behind it, and mark it on the map. */
@@ -567,13 +748,16 @@ export class World {
     if (den < 0 || den >= this.caveX.length) return -1;
     const cx = this.caveX[den], cy = this.caveY[den];
     if (Math.abs(cx - x) <= 1 && Math.abs(cy - y) <= 1) return -1;
-    const here = this.caveDist[this.idx(x, y)];
+    const field = this.denDist[den];
+    if (!field) return -1;
+    const here = field[this.idx(x, y)];
+    if (here < 0) return -1; // no walkable route to that den from here
     let bestStep = -1, best = here;
     for (let k = 0; k < N_MOVE; k++) {
       if (k === 4) continue; // standing still never gets you closer
       const nx = x + MOVE_DX[k], ny = y + MOVE_DY[k];
       if (!this.inBounds(nx, ny)) continue;
-      const d = this.caveDist[this.idx(nx, ny)];
+      const d = field[this.idx(nx, ny)];
       if (d >= 0 && d < best) { best = d; bestStep = k; }
     }
     return bestStep;
@@ -788,6 +972,72 @@ export class World {
         this.meatTotal = Math.max(0, this.meatTotal - MEAT_ROT_RATE);
       }
     }
+    if (this.tick % ITEM_SCATTER_EVERY === 0) this.scatterItems(this.scatterRng, false);
+    // Wind turns off the tick counter and never off Math.random(): a world
+    // whose wind cannot be reproduced is a world whose fire cannot be tuned,
+    // because the same seed has to give the same burn every time it is run.
+    this.wind = (Math.floor(this.tick / FIRE_WIND_TURNS_EVERY) % 4 + 4) % 4;
+  }
+
+  /** Kept so the scatter pass draws from one stream with its own state, and
+   *  not from the tick counter's neighbours. A world where the placement of a
+   *  rock depends on how much other unrelated code has asked the RNG for is a
+   *  world where a change to the population loop moves the treasure. */
+  private scatterRng: RNG;
+
+  /**
+   * Put rock and sticks back on the map.
+   *
+   * Rock lands on walkable ground beside a mountain — T_ROCK is 1.7% of the
+   * map, so "touches rock" is a shoreline around the ranges rather than a
+   * scattering over the whole world. Sticks land on T_FOREST, which is the
+   * woodline itself: a village measures 13 to 35 cells from wood, and sticks
+   * are meant to cost a walk.
+   *
+   * Neither competes with food. Rock and stick are a separate resource from
+   *  the food supply: this pass never reads or writes `plant` and never
+   *  marks ground fertile, so a village can strip a woodline and still be
+   *  standing in grass. A pixel starving because somebody picked up a stick
+   *  would mean the two resources were the same resource.
+   *
+   * The first call is the opening scatter, which is a full laying-down; after
+   * that it is a REGROW: only cells that are actually empty get something, so
+   *  a cell that already holds four sticks is not topped up and a harvested
+   *  woodline visibly recovers over time rather than instantly.
+   */
+  private scatterItems(rng: RNG, initial: boolean): void {
+    const ROCK_CHANCE = 0.05, STICK_CHANCE = 0.06;
+    // A full pass over 287k cells every ITEM_SCATTER_EVERY ticks is ~0.53 ms,
+    // which is two ticks' worth of frame budget for work that changes the
+    // world imperceptibly. Bounded by a candidate budget instead.
+    const budget = initial ? GRID_SIZE : 12000;
+    for (let n = 0; n < budget; n++) {
+      const x = rng.int(GRID_W), y = rng.int(GRID_H);
+      const i = this.idx(x, y);
+      const t = this.terrain[i];
+      if (t === T_ROCK || t === T_WATER) continue;
+
+      if (t === T_FOREST) {
+        if (this.stick[i] === 0 && rng.chance(STICK_CHANCE)) {
+          this.addItem(i, Item.STICK, 1);
+        }
+      }
+      // rock needs a mountain, not a wood: it is scree at the foot of one
+      if (this.rock[i] === 0 && this.touchesRock(x, y) && rng.chance(ROCK_CHANCE)) {
+        this.addItem(i, Item.ROCK, 1);
+      }
+    }
+  }
+
+  /** Is there a mountain cell within one step? Rock is scree, so it appears
+   *  where a mountainside meets ground something could have walked to. */
+  private touchesRock(x: number, y: number): boolean {
+    for (let k = 0; k < 4; k++) {
+      const nx = x + D4X[k], ny = y + D4Y[k];
+      if (!this.inBounds(nx, ny)) continue;
+      if (this.terrain[this.idx(nx, ny)] === T_ROCK) return true;
+    }
+    return false;
   }
 
   /** Drop meat where something was killed. */
@@ -806,6 +1056,99 @@ export class World {
     this.meat[i] -= got;
     this.meatTotal = Math.max(0, this.meatTotal - got);
     return got;
+  }
+
+  // --- loose items ---------------------------------------------------------
+
+  /** The field and its running total for one item kind. Indexed off the same
+   *  `Item` constants everything else uses, so a kind is never spelled as an
+   *  index at a call site — `Item.MEAT` on a pixel's hands has to be the same
+   *  2 that lands here. */
+  private itemField(kind: number): Float32Array {
+    return kind === Item.ROCK ? this.rock : this.stick;
+  }
+
+  /** Put down loose rock and sticks.
+   *
+   *  `addItem` is the only way anything enters the map and `takeItem` the only
+   *  way it leaves, because both of them also have to keep the sparse list in
+   *  step with the arrays. A direct `w.rock[i] += 1` from a caller would leave
+   *  a cell holding an item that no pass ever visits again, and it would not
+   *  show up in `rockTotal` either. */
+  addItem(i: number, kind: number, n: number): void {
+    if (n <= 0) return;
+    const f = this.itemField(kind);
+    if (kind === Item.ROCK) this.rockTotal += n; else this.stickTotal += n;
+    // A cell is listed once no matter how much lands on it, and the list is
+    // keyed by kind as well as by cell: rock and stick share one map, so a
+    // cell holding both has to be findable from either side.
+    if (f[i] === 0) {
+      this.itemList[this.itemCount++] = i;
+      this.itemKind[i] = kind;
+    }
+    f[i] += n;
+  }
+
+  /** Take up to `want` off a cell, and return how much was actually there. */
+  takeItem(i: number, kind: number, want: number): number {
+    const f = this.itemField(kind);
+    if (f[i] <= 0) return 0;
+    const got = Math.min(f[i], want);
+    f[i] -= got;
+    if (kind === Item.ROCK) this.rockTotal = Math.max(0, this.rockTotal - got);
+    else this.stickTotal = Math.max(0, this.stickTotal - got);
+    return got;
+  }
+
+  /** How much of one kind is on a cell. For a 0/1 question this is cheaper
+   *  than a `takeItem` that is going to be rolled back. */
+  itemAt(i: number, kind: number): number {
+    return this.itemField(kind)[i];
+  }
+
+  /** Drop a spent item back on the map. Separate from `addItem` only in
+   *  intent — it is the same call, and naming it separately is what stops
+   *  DROP and COMBINE from being written as a special case later. */
+  dropItem(i: number, kind: number, n: number): void {
+    this.addItem(i, kind, n);
+  }
+
+  // --- fire ----------------------------------------------------------------
+
+  /** Set a cell alight for `ticks`.
+   *
+   *  A cell already burning is not reset: re-lighting an existing fire would
+   *  make one blaze at a village a fire that never goes out, which is the
+   *  failure the FIRE_BURN_TICKS=30 comment is written about. `ignite` takes
+   *  the longer of the two counts instead, so a cell relit while it is still
+   *  hot stays lit the same amount of time it would have anyway. */
+  ignite(i: number, ticks: number): void {
+    if (this.fireFuel[i] <= 0) return;   // nothing to burn: it never catches
+    if (this.fire[i] > 0) {
+      this.fire[i] = Math.max(this.fire[i], ticks);
+      return;
+    }
+    this.fire[i] = ticks;
+    this.fireList[this.fireCount++] = i;
+    this.fireActive++;
+    this.firesLit++;
+  }
+
+  /** Is this cell alight? A countdown and not a boolean, so the renderer and
+   *  the sensor layer can read intensity out of the same field. */
+  isBurning(i: number): boolean {
+    return this.fire[i] > 0;
+  }
+
+  /** Can this cell catch at all?
+   *
+   *  Fuel-gating, and it is the only thing standing between a blaze and a
+   *  burnt-out world: measured over a 640x448 map, ungated spread at 0.05
+   *  consumes 99.3% of the food supply and is still climbing at 0.01
+   *  (scratch/diag27). A cell with no fuel cannot be lit, so the fire spends
+   *  the world's own biomass and goes out when the biomass does. */
+  flammable(i: number): boolean {
+    return this.fireFuel[i] > 0 && this.terrain[i] !== T_WATER;
   }
 
   /** Total edible energy in the world — the harness uses this to spot famine. */

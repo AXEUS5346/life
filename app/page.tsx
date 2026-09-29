@@ -14,6 +14,13 @@ export type Stats = {
   predators: number; predSmall: number;
   predKills: number; predMobbed: number; predBorn: number;
   meat: number;
+  /** Fires lit since the world began; `fireActive` cells alight right now. A
+   *  world with no fire in it is the normal state, so `firesLit` staying at 0
+   *  is information rather than a stalled counter. */
+  firesLit: number; fireActive: number; fireBurned: number; predBurned: number;
+  /** Loose rock and sticks on the ground, in whole items, and the number of
+   *  pixels with anything in their hands. */
+  rock: number; stick: number; carrying: number;
   /** The multiplier the user asked for. */
   speed: number;
   /** What the simulation actually achieved, measured over the last second.
