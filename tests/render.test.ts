@@ -20,6 +20,7 @@ import {
   T_OPEN, T_ROCK, T_WATER, T_DEAD, T_SAND, T_FOREST, T_MARSH, T_SNOW, T_CAVE,
   TICK_HZ, PRED_DEN_CAP, PRED_DEN_SCATTER, PRED_SMALL, PRED_LARGE, DAY_TICKS,
   PRED_SOFT_CAP, PRED_RESEED_FLOOR, PRED_RESEED_COUNT, PRED_BREED_MIN_PREY,
+  W_CLIP_RMS,
   MAX_CAMP_SLOTS,
   CAMP_HOME_R, CAMP_MARK_R, MOVE_DX, MOVE_DY,
   FOOD_CELL, FOOD_BUCKETS, FOOD_BUCKETS_X, FOOD_UNDERFOOT,
@@ -1733,4 +1734,81 @@ test('a species that has only just been wiped out is not re-seeded on the very n
   sim.step();
   assert.equal(p.count, 0,
     'a world whose re-seeding cooldown has not expired stays empty for one more tick');
+});
+
+/**
+ * Regression: gradients must be written in the agent's LOCAL coordinate space.
+ *
+ * `tdGrad` used to index `grad` with absolute offsets (`off + O_W2 + ...`) while
+ * `grad` is a per-agent scratch buffer only `N_PARAMS` long. For agent 0 that is
+ * the same address; for every other agent the writes start past the end of the
+ * array and are discarded silently, because a TypedArray ignores out-of-range
+ * writes rather than throwing. `applyRmsprop` then read the local window
+ * `[0, N_PARAMS)`, which `grad.fill(0)` had just zeroed — so 599 of 600 pixels
+ * were handed a buffer of zeros while their TD error sat unused. Measured: 5587
+ * live gradient entries for agent 0, 0 for every other agent, and a single
+ * population slot whose weights ever moved.
+ *
+ * The bug is invisible from a single agent's point of view, so it is asserted
+ * the way it actually presented: across a population, in the real `Sim`.
+ */
+test('every pixel learns, not just the one in slot 0', () => {
+  const sim = new Sim(4242);
+  sim.seedPopulation(START_POP);
+  sim.seedPredators(START_PREDATORS);
+  for (let i = 0; i < 200; i++) sim.step();
+
+  const before = Float32Array.from(sim.brains);
+  for (let i = 0; i < 200; i++) sim.step();
+
+  // Count pixels whose weights actually moved, by comparing each slot's slice.
+  const moved: number[] = [];
+  for (let a = 0; a < MAX_AGENTS; a++) {
+    if (!sim.agents.alive[a]) continue;
+    for (let p = 0; p < N_PARAMS; p++) {
+      if (sim.brains[a * N_PARAMS + p] !== before[a * N_PARAMS + p]) { moved.push(a); break; }
+    }
+  }
+
+  const live = sim.agents.count;
+  const frozen = live - moved.length;
+  assert.ok(live >= 5, `expected a populated world to test, had ${live} pixels`);
+  assert.equal(frozen, 0,
+    `every living pixel should learn; ${frozen} of ${live} were frozen. ` +
+    `Slots ${moved.join(', ')} moved; the rest did not.`);
+});
+
+/**
+ * The critic must converge to the discounted return of the reward it is fed,
+ * not to the ceiling. This is the sign convention, stated as a test because
+ * getting it backwards is silent: the value does not error, it does not look
+ * obviously wrong on screen, and the only symptom is a slow drift that ends in
+ * extinction thousands of ticks later.
+ *
+ * The old rule wrote `grad = +delta * df/dtheta` and then descended it, so the
+ * value moved *away* from its target. Rewards here are persistently negative
+ * (hunger and thirst subtract every tick), so the correct value is about
+ * r/(1-gamma) = -3, and the observed value ran the other way to +39 and stuck
+ * there. With V pinned, the TD error degenerates to a near-constant and the
+ * policy gradient stops discriminating between good and bad actions.
+ */
+test('the critic tracks its target instead of running away', () => {
+  const sim = new Sim(SEED);
+  sim.seedPopulation(START_POP);
+  sim.seedPredators(START_PREDATORS);
+  for (let t = 0; t < 1200; t++) sim.step();
+
+  const live: number[] = [];
+  for (let a = 0; a < MAX_AGENTS; a++) if (sim.agents.alive[a]) live.push(a);
+  assert.ok(live.length > 0, 'the world should still be alive at t=1200');
+
+  let meanV = 0;
+  for (const a of live) meanV += sim.hist.value[a];
+  meanV /= live.length;
+
+  assert.ok(meanV < 0,
+    `a world where hunger and thirst subtract every tick has a negative value; got ${meanV.toFixed(2)}. ` +
+    `A positive value means the critic is running away from its target.`);
+  assert.ok(meanV > -W_CLIP_RMS * 4,
+    `the value should track its target, not sit against the weight ceiling; got ${meanV.toFixed(2)}`);
 });

@@ -5,7 +5,7 @@
  *   node --experimental-strip-types harness/run.ts [seed] [ticks] [startPop] [quiet]
  */
 import { Sim } from '../sim/sim.ts';
-import { MAX_AGENTS, HARD_CAP, SOFT_CAP, TICK_MS, START_POP, START_PREDATORS, DAY_TICKS, PRED_DEN_CAP } from '../sim/constants.ts';
+import { MAX_AGENTS, HARD_CAP, SOFT_CAP, TICK_MS, START_POP, START_PREDATORS, DAY_TICKS, PRED_DEN_CAP, PRED_SOFT_CAP } from '../sim/constants.ts';
 
 const seed = Number(process.argv[2] ?? 12345);
 const TICKS = Number(process.argv[3] ?? 20000);
@@ -73,7 +73,7 @@ console.log(`  generation    ${maxGen}`);
 console.log(`  mean lifespan ${snap.meanLifespan.toFixed(0)} ticks`);
 console.log(`  deaths        ${JSON.stringify(snap.deaths)}`);
 console.log(`  kills         ${snap.kills}   betrayals ${snap.betraysals}`);
-console.log(`  predators     ${sim.predators.count} alive  peak ${peakPred}  cap ${PRED_DEN_CAP}`);
+console.log(`  predators     ${sim.predators.count} alive  peak ${peakPred}  cap ${PRED_SOFT_CAP} (${PRED_DEN_CAP} dens)`);
 console.log(`  pred ledger   eaten ${sim.predators.predKills} (${nightKills} at night, ${dayKills} by day)` +
             `  mobbed ${sim.predators.mobbed}  starved ${sim.predators.starved}  aged ${sim.predators.diedOfAge}  born ${sim.predators.born}`);
 console.log(`  day length    ${DAY_TICKS} ticks   phase now ${sim.world.phaseName}  daylight ${sim.world.daylight.toFixed(2)}`);

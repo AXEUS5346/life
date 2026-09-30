@@ -10,7 +10,8 @@ import {
 } from '../sim/constants.ts';
 import { GENE_NAMES } from '../sim/genome.ts';
 import { ticksDue, targetHz } from '../sim/pace.ts';
-import { forward, softmaxValue, BrainScratch } from '../sim/brain.ts';
+import { forward, BrainScratch, PARAM_OFFSETS } from '../sim/brain.ts';
+const { O_W1, O_B1, O_W2, O_B2, O_WV, O_BV, O_PARAMS_END } = PARAM_OFFSETS;
 import { fertilityAge, maxAgeFor } from '../sim/hormones.ts';
 import { buildInputs } from '../sim/sensors.ts';
 
@@ -83,7 +84,10 @@ export type AgentDetail = {  kind?: 'agent'; slot: number; age: number; maxAge: 
   hormones: { name: string; value: number }[];
   mate: number; bond: number; desperation: number; nausea: number;
   fertilityAge: number; lineageName: string;
-  brain: { w1: Float32Array; b1: Float32Array; w2: Float32Array; b2: Float32Array };
+  brain: {
+    w1: Float32Array; b1: Float32Array; w2: Float32Array; b2: Float32Array;
+    wv: Float32Array; bv: Float32Array;
+  };
   verbScores: { name: string; score: number }[];
 };
 
@@ -329,10 +333,12 @@ function detailFor(i: number): AgentDetail | null {
     fertilityAge: Math.round(fertilityAge(a.genes, i)),
     lineageName: lineageNames.get(a.founder[i]) ?? `Px-${a.founder[i]}`,
     brain: {
-      w1: sim.brains.slice(off, off + N_INPUTS * N_HIDDEN),
-      b1: sim.brains.slice(off + N_INPUTS * N_HIDDEN, off + N_INPUTS * N_HIDDEN + N_HIDDEN),
-      w2: sim.brains.slice(off + N_INPUTS * N_HIDDEN + N_HIDDEN, off + N_PARAMS - N_OUTPUTS),
-      b2: sim.brains.slice(off + N_PARAMS - N_OUTPUTS, off + N_PARAMS),
+      w1: sim.brains.slice(off + O_W1, off + O_B1),
+      b1: sim.brains.slice(off + O_B1, off + O_W2),
+      w2: sim.brains.slice(off + O_W2, off + O_B2),
+      b2: sim.brains.slice(off + O_B2, off + O_WV),
+      wv: sim.brains.slice(off + O_WV, off + O_BV),
+      bv: sim.brains.slice(off + O_BV, off + O_PARAMS_END),
     },
     verbScores,
   };

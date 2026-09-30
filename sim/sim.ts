@@ -38,7 +38,7 @@ import { SpatialIndex } from './spatial.ts';
 import { Predators, PredState } from './predators.ts';
 import { buildInputs, clearLine } from './sensors.ts';
 import {
-  initBrain, forward, softmaxValue, tdGrad, applyRmsprop, inheritBrain,
+  initBrain, forward, tdGrad, applyRmsprop, inheritBrain,
   BrainScratch, BrainHistory,
 } from './brain.ts';
 import { crossover, GENE } from './genome.ts';
@@ -309,6 +309,7 @@ export class Sim {
         const i = this.agents.alloc(this.rng, x, y);
         if (i < 0) break;
         initBrain(this.brains, i * N_PARAMS, this.rng);
+        this.rms.fill(0, i * N_PARAMS, (i + 1) * N_PARAMS);
         this.agents.bornTick[i] = 0;
         this.agents.campX[i] = gx;
         this.agents.campY[i] = gy;
@@ -339,6 +340,7 @@ export class Sim {
       const i = this.agents.alloc(this.rng, x, y);
       if (i < 0) break;
       initBrain(this.brains, i * N_PARAMS, this.rng);
+        this.rms.fill(0, i * N_PARAMS, (i + 1) * N_PARAMS);
       this.agents.bornTick[i] = 0;
       this.agents.campX[i] = cx;
       this.agents.campY[i] = cy;
@@ -862,6 +864,7 @@ export class Sim {
       // parent's weights and changes its village is a pixel whose behaviour
       // was learned in one place and is now expressed in another.
       initBrain(this.brains, i * N_PARAMS, this.rng);
+        this.rms.fill(0, i * N_PARAMS, (i + 1) * N_PARAMS);
       this.hist.clear(i);
     }
   }
@@ -938,6 +941,7 @@ export class Sim {
         const i = this.agents.alloc(this.rng, x, y);
         if (i < 0) break;
         initBrain(this.brains, i * N_PARAMS, this.rng);
+        this.rms.fill(0, i * N_PARAMS, (i + 1) * N_PARAMS);
         this.agents.bornTick[i] = this.tick;
         this.agents.campX[i] = sx;
         this.agents.campY[i] = sy;
@@ -1130,20 +1134,20 @@ export class Sim {
       const maxAge = maxAgeFor(a.genes, i);
 
       buildInputs(a, w, this.spatial, this.predators, i, maxAge, x);
-      forward(this.brains, i * N_PARAMS, x, this.scratch.hidden, this.scratch.outputs);
+      const vCur = forward(this.brains, i * N_PARAMS, x, this.scratch.hidden, this.scratch.outputs);
       const v = this.scratch.outputs;
-      const vCur = softmaxValue(v);
 
       // learn from the reward the previous action earned
       if (this.hist.hasPrev[i]) {
-        const delta = tdGrad(
+        tdGrad(
           this.brains, i * N_PARAMS, this.scratch.grad, this.scratch.dz, this.scratch.dh,
           this.hist.inputs.subarray(i * N_INPUTS, (i + 1) * N_INPUTS),
           this.hist.hidden.subarray(i * N_HIDDEN, (i + 1) * N_HIDDEN),
           this.hist.outputs.subarray(i * N_OUTPUTS, (i + 1) * N_OUTPUTS),
           this.hist.value[i], vCur, this.pendingReward[i],
+          this.hist.move[i], this.hist.verb[i],
         );
-        applyRmsprop(this.brains, i * N_PARAMS, this.rms, this.scratch.grad, delta);
+        applyRmsprop(this.brains, i * N_PARAMS, this.rms, this.scratch.grad);
       }
       this.hist.save(i, x, this.scratch.hidden, v, vCur);
 
@@ -1170,6 +1174,11 @@ export class Sim {
         if (sc > bestVerbScore) { bestVerbScore = sc; bestVerb = k; }
       }
 
+      // The policy gradient needs the action this tick's state produced, and
+      // it is only known here — after the argmax, a few lines below the point
+      // the state itself was saved.
+      this.hist.saveAction(i, bestMove, bestVerb);
+
       let reward = 0;
 
       // --- locomotion, first ---------------------------------------------
@@ -1185,7 +1194,27 @@ export class Sim {
       // village with nobody in it.
       switch (bestVerb) {
         case Verb.REST: {
-          reward += 0.15;
+          // Paid by how tired you are, not a flat per-tick bonus.
+          //
+          // It used to be a flat +0.15 for resting, which was the highest
+          // guaranteed return in the world: at gamma=0.95 the value function
+          // only looks ~20 ticks ahead, and standing still banks 0.15/0.05 = 3.0
+          // of value over that horizon, while EAT pays 1.5 * gained and only
+          // on the ticks where food is actually underfoot. The long-run cost of
+          // resting — energy falls faster than the +0.006/tick below restores
+          // it, so a permanent rester starves — lands well outside a 20-tick
+          // window and the value estimate never sees it.
+          //
+          // So learning worked, and learned the correct answer to the question
+          // it was actually asked. Measured on seed 20260927 once the gradient
+          // bug in `brain.ts` was fixed and all 600 pixels were learning for the
+          // first time, REST climbed 26% -> 34% -> 43% -> 47% of the verb mix as
+          // the population fell, and peak population fell from 486 to 19.
+          // Scaling the payout by the energy deficit keeps resting worth doing
+          // when you are actually worn out, and pays nothing for it when you
+          // are not, so there is no longer a free per-tick dividend on doing
+          // nothing.
+          reward += 0.15 * (1 - a.energy[i]);
           a.energy[i] = Math.min(1, a.energy[i] + 0.006);
           break;
         }
@@ -1842,7 +1871,7 @@ export class Sim {
     const sigma = 0.02 + (1 - attach) * 0.28;
     inheritBrain(
       this.brains, i * N_PARAMS,
-      p1 * N_PARAMS, p2 * N_PARAMS, alpha, sigma, this.rng,
+      p1 * N_PARAMS, p2 * N_PARAMS, alpha, sigma, this.rng, this.rms,
     );
 
     // the parents pay for it

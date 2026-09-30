@@ -250,13 +250,16 @@ export const MOVE_DY = [-1, -1, -1, 0, 0, 0, 1, 1, 1] as const;
 export const N_VERB = 10; // discrete verbs
 export const W1_SIZE = N_INPUTS * N_HIDDEN; // 4288
 export const B1_SIZE = N_HIDDEN; // 64
-export const W2_SIZE = N_HIDDEN * N_OUTPUTS; // 1216
+export const W2_SIZE = N_HIDDEN * N_OUTPUTS; // 1216  (policy logits: 9 move + 10 verbs)
 export const B2_SIZE = N_OUTPUTS; // 19
-export const N_PARAMS = W1_SIZE + B1_SIZE + W2_SIZE + B2_SIZE; // 5587
-export const OFF_W1 = 0;
-export const OFF_B1 = OFF_W1 + W1_SIZE;
-export const OFF_W2 = OFF_B1 + B1_SIZE;
-export const OFF_B2 = OFF_W2 + W2_SIZE;
+/** The critic: one scalar value head off the same hidden layer, with its own
+ *  weights. It used to be `softmaxValue(policy logits)` — the same 19 numbers
+ *  the policy chooses from — which meant the only gradient reaching the
+ *  action logits was value regression, and learning systematically eroded the
+ *  policy instead of improving it. See `tdGrad` in sim/brain.ts. */
+export const WV_SIZE = N_HIDDEN; // 64
+export const BV_SIZE = 1;
+export const N_PARAMS = W1_SIZE + B1_SIZE + W2_SIZE + B2_SIZE + WV_SIZE + BV_SIZE; // 5652
 
 // --- verbs (plain const object: `enum` is not erasable syntax) -------------
 /** GATHER, DROP and COMBINE are deliberately general.
@@ -791,10 +794,63 @@ export const FOOD_RESERVE_GENERATIONS = 6;
 export const FOOD_RESERVE = 130000;
 
 // --- tuning ----------------------------------------------------------------
-export const LEARNING_RATE = 0.01;
+/** Step size for both heads of the actor-critic.
+ *
+ *  Measured, not guessed, and the failure mode above it is sharp. Peak
+ *  population over 2000 ticks on two seeds, with every pixel learning and the
+ *  critic tracking its target:
+ *
+ *      lr = 0.01    peak  20 /  28     world collapses
+ *      lr = 0.001   peak 598 / 597     world saturates the 600 cap
+ *      lr = 0.0001  peak 596 / 589
+ *
+ *  An order of magnitude either side of 0.001 the world is healthy, so this is
+ *  a plateau rather than a knife edge — but 0.01 is well outside it. Note that
+ *  0.01 is the rate the old single-head rule shipped with, and it was very
+ *  likely never survivable: RMSprop normalises the step, so a rate that looks
+ *  reasonable on one well-conditioned network is a different animal once two
+ *  heads share a hidden layer and the critic's regression competes with the
+ *  policy for the same features. */
+export const LEARNING_RATE = 0.001;
 export const DISCOUNT = 0.95; // gamma
 export const RMS_EPS = 1e-8;
 export const RMS_DECAY = 0.9;
+
+/** Ceiling on a brain's weight RMS norm, applied after every update.
+ *
+ *  The value estimate is a softmax-weighted average of the same 19 logits the
+ *  policy chooses from, and that average is *unbounded*. Its gradient is
+ *  `dz[k] = p_k * (1 + (q_k - V) / T)`: for whichever logit currently dominates,
+ *  `q_k - V` is ~0 so it is pushed up, and for every other logit `q_k - V` is
+ *  large and negative so they are all pushed down. The softmax therefore
+ *  sharpens toward its own argmax on every step, and V climbs without limit —
+ *  no matter what the reward says.
+ *
+ *  It climbed, too. Measured on seed 4242 with all 600 pixels learning (see
+ *  `sim/brain.ts`, which used to leave 599 of them frozen, so this was hidden
+ *  behind a single agent that only reached 7.7 before the world died):
+ *  mean value 0 -> 41 -> 302 -> 1711 -> 13427 -> 178289 -> 564308 by t=550,
+ *  ~2.7x per 50 ticks, against a mean |reward| of 0.15 that never exceeded 0.45
+ *  and a hunger stat that saturates at 1.0. The world went extinct at t=600.
+ *
+ *  Clipping the TD error would not have helped, which is worth writing down:
+ *  the RMSprop step is `LEARNING_RATE * g / sqrt(r)` with `r` an EMA of `g^2`,
+ *  so scaling `g` down scales `sqrt(r)` down by the same factor and the ratio
+ *  is unchanged. The update is scale-invariant, so a bounded gradient still
+ *  buys a full-size step. The quantity that has to be bounded is the weight
+ *  vector, because that is what bounds the logits, which is what bounds V. */
+export const W_CLIP_RMS = 3.0;
+
+/** Clamp on the advantage used for the *policy* update only.
+ *
+ *  The critic is fed the raw TD error, because that is the value it is trying
+ *  to regress. The policy is not: one unusually large error — a single
+ *  unusually good meal, a predator kill — would otherwise apply a full-size
+ *  RMSprop step to whichever action happened to precede it, which is how an
+ *  actor turns into an agent that chases one rare event forever. The delta is
+ *  a running estimate rather than a terminal outcome, so treating an outlier
+ *  as an outlier is the correct treatment. */
+export const ADV_CLIP = 1.0;
 export const EPSILON_START = 0.25;
 export const EPSILON_END = 0.05;
 export const EPSILON_DECAY_TICKS = 40_000; // global sim-tick ramp
